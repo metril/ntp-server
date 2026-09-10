@@ -102,11 +102,18 @@ fi
 # root-owned; chronyd runs as chrony:chrony after dropping privs and needs
 # to write drift/rtc/nts-dump files and create its command socket.
 chown -R chrony:chrony /var/lib/chrony
-# chmod before chown: once the dir is chrony-owned, chmod as root needs
-# CAP_FOWNER, which compose drops (cap_drop: ALL).
+# chmod as root needs CAP_FOWNER (dropped by compose) unless root owns the
+# dir, and on restarts the persistent volume is already chrony-owned. Take
+# it back with CAP_CHOWN, set the mode, then hand it to chrony.
 mkdir -p /run/chrony
+chown root:root /run/chrony
 chmod 0750 /run/chrony
 chown chrony:chrony /run/chrony
+# The volume persists across restarts, so a stale pid file/socket from an
+# unclean stop survives; in a fresh pid namespace the recorded pid often
+# exists, making chronyd refuse to start ("Another chronyd may already be
+# running"). Nothing else runs in this container, so they're always stale.
+rm -f /run/chrony/chronyd.pid /run/chrony/chronyd.sock
 
 CHRONYD_PID=""
 
