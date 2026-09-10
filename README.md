@@ -109,15 +109,21 @@ Copy `.env.example` to `.env` and fill in:
 ## Deploy
 
 ```sh
-docker compose pull
-docker compose up -d
+docker compose --profile geoip pull
+docker compose --profile geoip up -d
 ```
+
+`--profile geoip` starts the `geoipupdate` service that fetches the GeoLite2
+databases for the client geography panels. It is required on every `up`, `pull`,
+`down`, and `restart`: a plain `docker compose up -d` skips it and the dashboard
+shows every client as country "unknown". Only omit it if you have no MaxMind
+credentials (see "Client geography + pool.ntp.org score").
 
 With NTS enabled, layer the overlay that mounts the cert/key (also requires
 `NTS_ENABLED=true` in `.env`):
 
 ```sh
-docker compose -f compose.yaml -f compose.nts.yaml up -d
+docker compose --profile geoip -f compose.yaml -f compose.nts.yaml up -d
 ```
 
 ## Releases
