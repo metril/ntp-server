@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "Loki logs for the NTP server (job=ntp-server).",
+  "description": "VictoriaLogs for the NTP server (job=ntp-server).",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -23,7 +23,7 @@
   "links": [],
   "panels": [
     {
-      "datasource": { "type": "loki", "uid": "${logs_datasource}" },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "dfxl6qe5kkum8c" },
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -45,9 +45,10 @@
       },
       "targets": [
         {
-          "datasource": { "type": "loki", "uid": "${logs_datasource}" },
-          "expr": "sum by (container) (count_over_time({job=\"ntp-server\", host=\"$host\"}[1m]))",
+          "datasource": { "type": "victoriametrics-logs-datasource", "uid": "dfxl6qe5kkum8c" },
+          "expr": "{job=\"ntp-server\", host=~\"${host:regex}\"} ~\"(?i)$search\" | stats by (container) count() as count",
           "legendFormat": "{{container}}",
+          "queryType": "statsRange",
           "refId": "A"
         }
       ],
@@ -55,7 +56,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "loki", "uid": "${logs_datasource}" },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "dfxl6qe5kkum8c" },
       "gridPos": { "h": 18, "w": 24, "x": 0, "y": 6 },
       "id": 2,
       "options": {
@@ -69,9 +70,9 @@
       },
       "targets": [
         {
-          "datasource": { "type": "loki", "uid": "${logs_datasource}" },
-          "expr": "{job=\"ntp-server\", host=\"$host\"} |~ \"$search\"",
-          "queryType": "range",
+          "datasource": { "type": "victoriametrics-logs-datasource", "uid": "dfxl6qe5kkum8c" },
+          "expr": "{job=\"ntp-server\", host=~\"${host:regex}\"} ~\"(?i)$search\"",
+          "queryType": "raw",
           "refId": "A"
         }
       ],
@@ -85,22 +86,28 @@
   "templating": {
     "list": [
       {
-        "current": {},
-        "label": "Loki datasource",
-        "name": "logs_datasource",
-        "query": "loki",
-        "type": "datasource"
-      },
-      {
-        "current": {},
-        "datasource": { "type": "loki", "uid": "${logs_datasource}" },
-        "definition": "label_values({job=\"ntp-server\"}, host)",
-        "includeAll": false,
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "allValue": ".+",
+        "datasource": { "type": "victoriametrics-logs-datasource", "uid": "dfxl6qe5kkum8c" },
+        "definition": "field_values(host, {job=\"ntp-server\"})",
+        "includeAll": true,
         "label": "Host",
-        "multi": false,
+        "multi": true,
         "name": "host",
-        "options": [],
-        "query": { "query": "label_values({job=\"ntp-server\"}, host)", "refId": "StandardVariableQuery" },
+        "query": {
+          "field": "host",
+          "limit": 1000,
+          "query": "{job=\"ntp-server\"}",
+          "refId": "VictoriaLogsVariableQueryEditor-VariableQuery",
+          "type": "fieldValue"
+        },
         "refresh": 2,
         "sort": 1,
         "type": "query"
