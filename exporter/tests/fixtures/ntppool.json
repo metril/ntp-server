@@ -1,0 +1,13 @@
+{
+  "server": {"ip": "203.0.113.1"},
+  "monitors": [
+    {"id": 1, "name": "mon-lax", "type": "monitor", "ts": "2026-09-10T00:00:00Z", "score": 18.2, "status": "active", "avg_rtt": 12.3},
+    {"id": 2, "name": "mon-fra", "type": "monitor", "ts": "2026-09-10T00:00:00Z", "score": 17.9, "status": "active", "avg_rtt": 45.1}
+  ],
+  "history": [
+    {"ts": "2026-09-10T10:00:00Z", "offset": 0.0001, "rtt": 12.0, "score": 18.0, "monitor_id": 1, "step": 1},
+    {"ts": "2026-09-10T11:00:00Z", "offset": 0.0002, "rtt": 13.5, "score": 18.4, "monitor_id": 1, "step": 2},
+    {"ts": "2026-09-10T10:30:00Z", "offset": -0.0005, "rtt": 44.0, "score": 17.5, "monitor_id": 2, "step": 1},
+    {"ts": "2026-09-10T11:15:00Z", "offset": -0.0003, "rtt": 46.2, "score": 17.8, "monitor_id": 2, "step": 2}
+  ]
+}

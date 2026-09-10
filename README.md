@@ -98,10 +98,13 @@ Copy `.env.example` to `.env` and fill in:
 | `DOCKER_GID` | yes | From `scripts/check-host.sh`; lets Alloy read `docker.sock`. |
 | `POOL_SERVERS` | no | Extra space-separated fallback NTP servers (added on top of the built-in `time.cloudflare.com`, `time.nist.gov`, `pool 2.pool.ntp.org`). |
 | `RATELIMIT_INTERVAL` / `RATELIMIT_BURST` | no | `ratelimit` line defaults (`3` / `8`). |
-| `CLIENTLOGLIMIT` | no | Bytes of per-client log memory (default `4194304`); never set `noclientlog`, it disables `ratelimit` and the `clients` metrics. |
+| `CLIENTLOGLIMIT` | no | Bytes of per-client log memory (default `16777216`); never set `noclientlog`, it disables `ratelimit` and the `clients` metrics. |
 | `NTS_ENABLED` | no | `true` to enable NTS (see below); default `false`. |
 | `NTS_CERT_DIR` | if NTS | Host directory containing an externally-renewed cert/key, mounted read-only at `/certs` (mount the directory, not the files, so renewal isn't orphaned by inode pinning — see `.env.example` for the Let's Encrypt symlink caveat). |
 | `NTS_CERT_NAME` / `NTS_KEY_NAME` | no | Cert/key paths relative to `NTS_CERT_DIR` (default `fullchain.pem` / `privkey.pem`). |
+| `NTPPOOL_IPV4` | no | This server's public IPv4; polls its pool.ntp.org monitoring score. Leave empty to skip. |
+| `GEOIPUPDATE_ACCOUNT_ID` / `GEOIPUPDATE_LICENSE_KEY` | no | MaxMind GeoLite2 credentials for client geo/ASN metrics. Leave empty to skip. |
+| `NTP_ASN_TOP_N` | no | Top ASNs kept as distinct labels before folding the rest into `asn="other"` (default `25`). |
 
 ## Deploy
 
@@ -185,6 +188,37 @@ If this counter is climbing, the client log is full and `ratelimit` can no longe
 new clients accurately — raise `CLIENTLOGLIMIT` in `.env` and redeploy. Don't disable
 tracking (`noclientlog`) to fix it — that kills both `ratelimit` and the `chrony_clients_*`
 metrics.
+
+## Client geography + pool.ntp.org score
+
+The `ntp-clients-exporter` sidecar polls `chronyc clients` every 60s to export per-country
+and per-ASN request/drop counters (`ntp_client_requests_total`, `ntp_client_drops_total`,
+`ntp_client_requests_by_asn_total`) plus active/unique-client gauges, and separately polls
+`ntppool.org`'s public score JSON for this server's monitoring score
+(`ntppool_score`, `ntppool_monitor_score`, `ntppool_monitor_offset_seconds`,
+`ntppool_monitor_rtt_seconds`). Both feed the dashboard's Clients and pool.ntp.org rows.
+
+**Privacy**: raw client IPs never leave the Pi. The exporter geo/ASN-enriches each IP in
+memory against local MaxMind databases and only exports country/ASN labels and counts —
+no IP-labeled metric or log line is produced.
+
+Setup:
+
+1. Sign up for a free MaxMind account at [maxmind.com](https://www.maxmind.com/en/geolite2/signup),
+   generate a license key under *My License Keys*, and set `GEOIPUPDATE_ACCOUNT_ID` /
+   `GEOIPUPDATE_LICENSE_KEY` in `.env`. The `geoipupdate` service is gated behind the
+   `geoip` compose profile, so start it with `--profile geoip` or
+   `COMPOSE_PROFILES=geoip` once those are set; it then fetches
+   `GeoLite2-Country`/`GeoLite2-ASN` into the `geoip` volume on start and weekly thereafter.
+   Without it (or before the DBs land), client geo/ASN metrics report country="unknown".
+2. Set `NTPPOOL_IPV4` to this server's public IPv4 to enable the pool.ntp.org score
+   collector; leave it empty to skip it.
+3. `NTP_ASN_TOP_N` (default `25`) bounds `ntp_client_requests_by_asn_total` cardinality —
+   only the top-N ASNs by cumulative traffic get their own label value, the rest fold into
+   `asn="other"`. Country cardinality is naturally bounded (≤ ~250 ISO codes), so it has no
+   equivalent knob.
+4. Import `alerts/ntppool-score.yaml` into Grafana (provisioned alert rule, fires when
+   `ntppool_score < 10` for 15m) alongside the dashboard.
 
 ## NTS notes
 

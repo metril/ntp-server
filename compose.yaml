@@ -12,7 +12,7 @@ services:
       POOL_SERVERS: ${POOL_SERVERS:-}
       RATELIMIT_INTERVAL: ${RATELIMIT_INTERVAL:-3}
       RATELIMIT_BURST: ${RATELIMIT_BURST:-8}
-      CLIENTLOGLIMIT: ${CLIENTLOGLIMIT:-4194304}
+      CLIENTLOGLIMIT: ${CLIENTLOGLIMIT:-16777216}
       NTS_ENABLED: ${NTS_ENABLED:-false}
 
     volumes:
@@ -77,6 +77,45 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  ntp-clients-exporter:
+    image: ghcr.io/metril/ntp-server-exporter:${NTP_SERVER_TAG:-latest}
+    container_name: ntp-clients-exporter
+    restart: unless-stopped
+    network_mode: host
+    # Same chrony uid:gid as chrony-exporter - needed to read the chronyd
+    # unix socket and create its own reply socket under /run/chrony.
+    user: "100:101"
+
+    environment:
+      NTPPOOL_IPV4: ${NTPPOOL_IPV4:-}
+      NTP_ASN_TOP_N: ${NTP_ASN_TOP_N:-25}
+
+    volumes:
+      - chrony-run:/run/chrony
+      - geoip:/geoip:ro
+
+    depends_on:
+      chrony:
+        condition: service_healthy
+
+    security_opt:
+      - no-new-privileges:true
+
+  geoipupdate:
+    image: ghcr.io/maxmind/geoipupdate
+    container_name: geoipupdate
+    restart: unless-stopped
+    profiles: ["geoip"]
+
+    environment:
+      GEOIPUPDATE_ACCOUNT_ID: ${GEOIPUPDATE_ACCOUNT_ID:-}
+      GEOIPUPDATE_LICENSE_KEY: ${GEOIPUPDATE_LICENSE_KEY:-}
+      GEOIPUPDATE_EDITION_IDS: GeoLite2-Country GeoLite2-ASN
+      GEOIPUPDATE_FREQUENCY: 168
+
+    volumes:
+      - geoip:/usr/share/GeoIP
+
   alloy:
     image: grafana/alloy:latest
     container_name: alloy
@@ -129,3 +168,5 @@ services:
 
 volumes:
   chrony-run:
+  # MMDB files from geoipupdate; on the Pi's disk (a few MB), not tmpfs.
+  geoip:

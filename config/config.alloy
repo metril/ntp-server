@@ -56,6 +56,17 @@ prometheus.scrape "chrony" {
 	scrape_interval = "15s"
 }
 
+// ntp-clients-exporter runs in its own container, bound to loopback per compose.yaml.
+prometheus.scrape "ntp_clients" {
+	targets = [
+		{"__address__" = "127.0.0.1:9124"},
+	]
+
+	forward_to      = [prometheus.remote_write.victoriametrics.receiver]
+	job_name        = "ntp-clients"
+	scrape_interval = "60s"
+}
+
 prometheus.remote_write "victoriametrics" {
 	endpoint {
 		url = sys.env("VM_URL")
@@ -81,9 +92,9 @@ prometheus.remote_write "victoriametrics" {
 // ---------------------------------------------------------------------------
 // Container logs.
 //
-// Only this stack's three containers are shipped; discovery.docker sees
+// Only this stack's containers are shipped; discovery.docker sees
 // every container on the Docker host, so a keep rule below restricts to the
-// container_names compose.yaml pins before anything else. All three are
+// container_names compose.yaml pins before anything else. All are
 // labeled job="ntp-server" so the dashboard query stays a single selector
 // regardless of which container emitted the line. 'container' strips the leading "/" Docker puts on
 // __meta_docker_container_name.
@@ -101,7 +112,7 @@ discovery.relabel "containers" {
 	// silently drop every line - including Alloy's own.
 	rule {
 		source_labels = ["__meta_docker_container_name"]
-		regex         = "/(chrony|chrony-exporter|alloy)"
+		regex         = "/(chrony|chrony-exporter|alloy|ntp-clients-exporter|geoipupdate)"
 		action        = "keep"
 	}
 

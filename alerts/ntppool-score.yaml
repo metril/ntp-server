@@ -1,0 +1,50 @@
+# Grafana file-provisioned alert rule.
+# The dashboard (dashboards/ntp-server.json) selects its VictoriaMetrics datasource
+# via the ${datasource} template variable, so there is no single fixed uid to reuse
+# here. Replace PLACEHOLDER_VM_METRICS_DATASOURCE_UID below with the uid of the
+# victoriametrics-metrics-datasource instance this Grafana points at (see
+# Settings > Data sources, or dashboards/ntp-server-logs.json for the sibling
+# logs-datasource uid as an example of the format).
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: ntp-server
+    folder: NTP Server
+    interval: 1m
+    rules:
+      - uid: ntppool-score-low
+        title: pool.ntp.org score low
+        condition: C
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "pool.ntp.org score for {{ $labels.host }} is below 10"
+          description: "ntppool_score has been below 10 for at least 15 minutes. The server may be removed from the pool if this persists."
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: PLACEHOLDER_VM_METRICS_DATASOURCE_UID
+            model:
+              expr: ntppool_score
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params:
+                      - 10
+              refId: C
+        noDataState: NoData
+        execErrState: Error
