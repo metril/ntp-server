@@ -1,6 +1,8 @@
 services:
   chrony:
-    build: .
+    image: ghcr.io/metril/ntp-server:${NTP_SERVER_TAG:-latest}
+    # Local dev: comment out the image line and uncomment to build from source.
+    # build: .
     container_name: chrony
     restart: unless-stopped
     network_mode: host

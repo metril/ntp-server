@@ -70,6 +70,7 @@ Copy `.env.example` to `.env` and fill in:
 
 | Var | Required | Notes |
 |---|---|---|
+| `NTP_SERVER_TAG` | no | Tag of `ghcr.io/metril/ntp-server` to run (default `latest`); pin to `X.Y.Z` in production. |
 | `GRANDMASTER_HOST` | yes | Local time grandmaster, synced via NTP unicast (`prefer`). |
 | `ALLOY_INSTANCE` | yes | `host` label on metrics/logs; set to this host's name. |
 | `VM_URL` | yes | VictoriaMetrics remote_write endpoint. |
@@ -87,7 +88,7 @@ Copy `.env.example` to `.env` and fill in:
 ## Deploy
 
 ```sh
-docker compose build
+docker compose pull
 docker compose up -d
 ```
 
@@ -97,6 +98,12 @@ With NTS enabled, layer the overlay that mounts the cert/key (also requires
 ```sh
 docker compose -f compose.yaml -f compose.nts.yaml up -d
 ```
+
+## Releases
+
+Pushes to `main` build and publish `edge` and `sha-<short>` image tags. Pushing a
+`vX.Y.Z` tag builds for `amd64`+`arm64`, publishes `X.Y.Z`, `X.Y`, and `latest`, and
+creates a GitHub Release.
 
 ## Verify
 
