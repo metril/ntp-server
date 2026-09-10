@@ -98,7 +98,9 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./config:/etc/alloy:ro
-      - ./data:/var/lib/alloy/data
+      # Not /var/lib/alloy/data: the image ships /var/lib/alloy as 0770 owned
+      # by its internal uid 473, so uid 1000 cannot traverse into a mount there.
+      - ./data:/alloy-data
       # Host filesystem/diskstats view (rslave so bind-mount propagation
       # events are visible read-only) - config.alloy points rootfs_path at
       # this. cpu/meminfo/netdev/hwmon don't need it: those already read the
@@ -108,7 +110,7 @@ services:
     command:
       - run
       - --server.http.listen-addr=127.0.0.1:12345
-      - --storage.path=/var/lib/alloy/data
+      - --storage.path=/alloy-data
       - /etc/alloy/config.alloy
 
     depends_on:
