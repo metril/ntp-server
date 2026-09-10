@@ -162,6 +162,11 @@ own datasource variable — bind `datasource` (Prometheus, ntp-server.json) and
 `logs_datasource` (Loki-compatible, ntp-server-logs.json) to your VictoriaMetrics /
 VictoriaLogs datasources on import, and set the `host` variable to `ALLOY_INSTANCE`.
 
+The "Requests by country" geomap uses CARTO basemap tiles, which need a free API key
+(https://carto.com/basemaps/apikey/). Replace `CARTO_API_KEY` in the panel's basemap
+URL after import. Grafana 13.3+ switches to CARTO vector styles that need no key, so
+the basemap can be reset to "Default" once you upgrade.
+
 ## pool.ntp.org registration
 
 1. The Pi needs a static LAN IP and a stable public IP (or DNS record) with UDP 123

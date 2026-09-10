@@ -1582,9 +1582,12 @@
       "id": 23,
       "options": {
         "basemap": {
-          "config": {},
-          "name": "Layer 0",
-          "type": "default"
+          "type": "xyz",
+          "name": "CARTO Dark Matter",
+          "config": {
+            "url": "https://basemaps.cartocdn.com/rastertiles/dark_all/{z}/{x}/{y}.png?key=CARTO_API_KEY",
+            "attribution": "\u00a9 <a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap</a> contributors \u00a9 <a href=\"https://carto.com/attributions\">CARTO</a>"
+          }
         },
         "controls": {
           "mouseWheelZoom": true,
