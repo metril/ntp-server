@@ -83,9 +83,9 @@ prometheus.remote_write "victoriametrics" {
 //
 // Only this stack's three containers are shipped; discovery.docker sees
 // every container on the Docker host, so a keep rule below restricts to the
-// container_names compose.yaml pins before anything else. Within that project all are labeled job="ntp-server" so the
-// dashboard query stays a single selector regardless of which container
-// emitted the line. 'container' strips the leading "/" Docker puts on
+// container_names compose.yaml pins before anything else. All three are
+// labeled job="ntp-server" so the dashboard query stays a single selector
+// regardless of which container emitted the line. 'container' strips the leading "/" Docker puts on
 // __meta_docker_container_name.
 // ---------------------------------------------------------------------------
 discovery.docker "containers" {
