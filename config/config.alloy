@@ -33,6 +33,7 @@ prometheus.exporter.unix "host" {
 		"hwmon",
 		"thermal_zone",
 		"loadavg",
+		"stat",
 		"uname",
 	]
 }

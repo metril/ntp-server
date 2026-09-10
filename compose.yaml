@@ -65,6 +65,8 @@ services:
       # rejects them over the UDP cmdport.
       - --chrony.address=unix:///run/chrony/chronyd.sock
       - --web.listen-address=127.0.0.1:9123
+      - --collector.sources
+      - --collector.serverstats
       - --collector.clients
       - --no-collector.dns-lookups
 
