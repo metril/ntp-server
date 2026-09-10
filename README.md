@@ -83,7 +83,6 @@ Copy `.env.example` to `.env` and fill in:
 | `NTS_ENABLED` | no | `true` to enable NTS (see below); default `false`. |
 | `NTS_CERT_DIR` | if NTS | Host directory containing an externally-renewed cert/key, mounted read-only at `/certs` (mount the directory, not the files, so renewal isn't orphaned by inode pinning — see `.env.example` for the Let's Encrypt symlink caveat). |
 | `NTS_CERT_NAME` / `NTS_KEY_NAME` | no | Cert/key paths relative to `NTS_CERT_DIR` (default `fullchain.pem` / `privkey.pem`). |
-| `NTS_CERT_CHECK_INTERVAL` | no | Seconds between cert/key change checks (default `60`). |
 
 ## Deploy
 
@@ -167,10 +166,14 @@ metrics.
 - Cert/key renewal is **external** — nothing in this stack issues or renews certificates.
   Point `NTS_CERT_DIR` at the directory your renewal process (e.g. certbot) writes into
   (not the individual files — see `.env.example`).
-- chrony 4.5 cannot hot-reload `ntsservercert`/`ntsserverkey`. The entrypoint's watcher
-  hashes the host-mounted cert+key every `NTS_CERT_CHECK_INTERVAL` seconds; on a change it
-  exits, and `restart: unless-stopped` brings the container back up with the new files.
-  NTS-KE cookies survive the restart via `ntsdumpdir`.
+- chrony 4.5 cannot hot-reload `ntsservercert`/`ntsserverkey`. The entrypoint watches the
+  mounted cert/key directories with `inotifywait` (watching directories, not the files
+  themselves, since certbot's renewal replaces files in `archive/` and repoints the
+  `live/` symlinks rather than editing them in place) and re-hashes the cert+key on any
+  event; on a change it exits, and `restart: unless-stopped` brings the container back up
+  with the new files. NTS-KE cookies survive the restart via `ntsdumpdir`. This requires
+  `NTS_CERT_DIR` to be a local-filesystem bind mount — inotify events don't propagate over
+  network filesystems (NFS, etc.).
 - The cert's CN/SAN **must match the DNS name clients use** to connect over NTS (the name
   they put in `server ... nts`), not the Pi's internal hostname.
 - The key is copied into the container at `/tmp/nts-server.key`, owned `root:chrony`, mode

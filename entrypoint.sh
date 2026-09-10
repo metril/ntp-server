@@ -17,7 +17,6 @@ NTS_KEY_TMP=/tmp/nts-server.key
 NTS_CERT_TMP=/tmp/nts-server.crt
 
 NTS_ENABLED="${NTS_ENABLED:-false}"
-NTS_CERT_CHECK_INTERVAL="${NTS_CERT_CHECK_INTERVAL:-60}"
 RATELIMIT_INTERVAL="${RATELIMIT_INTERVAL:-3}"
 RATELIMIT_BURST="${RATELIMIT_BURST:-8}"
 CLIENTLOGLIMIT="${CLIENTLOGLIMIT:-4194304}"
@@ -136,22 +135,57 @@ if [ "$NTS_ENABLED" = "true" ]; then
 	# pair). So on change we just exit and let `restart: unless-stopped`
 	# bring chronyd back up with the new files. NTS-KE cookies survive via
 	# ntsdumpdir.
-	(
-		prev_hash="$(hash_nts_files)"
-		while true; do
-			sleep "$NTS_CERT_CHECK_INTERVAL"
-			if ! kill -0 "$CHRONYD_PID" 2>/dev/null; then
-				exit 0
+	if ! command -v inotifywait >/dev/null 2>&1; then
+		echo "entrypoint: inotifywait not found (inotify-tools missing from image)" >&2
+		kill -TERM "$CHRONYD_PID" 2>/dev/null || true
+	else
+		(
+			prev_hash="$(hash_nts_files)"
+
+			check_and_restart() {
+				if ! kill -0 "$CHRONYD_PID" 2>/dev/null; then
+					exit 0
+				fi
+				cur_hash="$(hash_nts_files)"
+				if [ "$cur_hash" != "$prev_hash" ]; then
+					echo "entrypoint: NTS cert/key changed, restarting chronyd to load it"
+					copy_nts_files
+					kill -TERM "$CHRONYD_PID" 2>/dev/null || true
+					exit 0
+				fi
+			}
+
+			# inotifywait on a symlink follows it to the archive/ inode,
+			# which certbot never touches again after the swap - so watch
+			# the containing directories instead (create/moved_to/etc.)
+			# and keep the md5sum compare as the authoritative test;
+			# inotify events here are only a wake-up.
+			watch_dirs="$(dirname "$NTS_CERT_SRC")"
+			resolved_dir="$(dirname "$(readlink -f "$NTS_CERT_SRC" 2>/dev/null)" 2>/dev/null || true)"
+			if [ -n "$resolved_dir" ] && [ -d "$resolved_dir" ] && [ "$resolved_dir" != "$watch_dirs" ]; then
+				watch_dirs="$watch_dirs $resolved_dir"
 			fi
-			cur_hash="$(hash_nts_files)"
-			if [ "$cur_hash" != "$prev_hash" ]; then
-				echo "entrypoint: NTS cert/key changed, restarting chronyd to load it"
-				copy_nts_files
+
+			# Run once up front to close the race between prev_hash above
+			# and inotifywait actually starting to watch.
+			check_and_restart
+
+			set +e
+			inotifywait -m -q -e create,moved_to,delete,delete_self,attrib,close_write $watch_dirs |
+				while read -r _; do
+					sleep 2
+					check_and_restart
+				done
+			# Reached only if the pipeline exits on its own (inotifywait
+			# died, etc.) without check_and_restart having exited us -
+			# that's a watcher failure, not a clean shutdown.
+			if kill -0 "$CHRONYD_PID" 2>/dev/null; then
+				echo "entrypoint: NTS cert/key watcher exited unexpectedly" >&2
 				kill -TERM "$CHRONYD_PID" 2>/dev/null || true
-				exit 0
 			fi
-		done
-	) &
+			exit 0
+		) &
+	fi
 fi
 
 set +e

@@ -1,6 +1,6 @@
 FROM alpine:3.20
 
-RUN apk add --no-cache chrony tzdata
+RUN apk add --no-cache chrony tzdata inotify-tools
 
 COPY chrony.conf.template /etc/chrony/chrony.conf.template
 COPY entrypoint.sh /entrypoint.sh

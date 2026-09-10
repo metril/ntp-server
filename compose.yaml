@@ -12,7 +12,6 @@ services:
       RATELIMIT_BURST: ${RATELIMIT_BURST:-8}
       CLIENTLOGLIMIT: ${CLIENTLOGLIMIT:-4194304}
       NTS_ENABLED: ${NTS_ENABLED:-false}
-      NTS_CERT_CHECK_INTERVAL: ${NTS_CERT_CHECK_INTERVAL:-60}
 
     volumes:
       - ./chrony-data:/var/lib/chrony
