@@ -1,10 +1,6 @@
 # Grafana file-provisioned alert rule.
-# The dashboard (dashboards/ntp-server.json) selects its VictoriaMetrics datasource
-# via the ${datasource} template variable, so there is no single fixed uid to reuse
-# here. Replace PLACEHOLDER_VM_METRICS_DATASOURCE_UID below with the uid of the
-# victoriametrics-metrics-datasource instance this Grafana points at (see
-# Settings > Data sources, or dashboards/ntp-server-logs.json for the sibling
-# logs-datasource uid as an example of the format).
+# datasourceUid is the homelab VictoriaMetrics datasource (Settings > Data sources).
+# Change it if this Grafana points at a different victoriametrics-metrics-datasource.
 apiVersion: 1
 
 groups:
@@ -27,7 +23,7 @@ groups:
             relativeTimeRange:
               from: 600
               to: 0
-            datasourceUid: PLACEHOLDER_VM_METRICS_DATASOURCE_UID
+            datasourceUid: afwsbh7gha9kwf
             model:
               expr: ntppool_score
               instant: true
