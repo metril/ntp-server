@@ -44,7 +44,9 @@ services:
       start_period: 60s
 
   chrony-exporter:
-    image: ghcr.io/superq/chrony_exporter:latest
+    # SuperQ publishes per-arch images (no multi-arch manifest); this is the
+    # Orange Pi (arm64) one. Use chrony-exporter-linux-amd64 on x86 hosts.
+    image: quay.io/superq/chrony-exporter-linux-arm64:v0.14.0
     container_name: chrony-exporter
     restart: unless-stopped
     network_mode: host
