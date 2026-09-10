@@ -2,3 +2,6 @@
 data/
 chrony-data/
 geoip/
+HANDOFF.md
+*.handoff.md
+notes/
