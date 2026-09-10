@@ -5,9 +5,51 @@
 # still active, or something already bound to UDP 123). Informational items
 # (docker gid, hwmon names, logging driver) are printed either way so the
 # operator can wire them into .env / compose without a second pass.
+#
+# Usage: check-host.sh [--fix|--no-fix] [-h|--help]
+#   --fix     apply fixes for detected problems without prompting
+#   --no-fix  check only, never prompt or fix (default when stdin isn't a tty)
+#   (none)    if stdin is a tty, prompt per problem "Fix now? [y/N]";
+#             otherwise behaves like --no-fix
 set -u
 
 status=0
+MODE=""
+
+usage() {
+    cat <<'EOF'
+Usage: check-host.sh [--fix|--no-fix] [-h|--help]
+
+  --fix     apply fixes for detected problems without prompting
+  --no-fix  check only, never prompt or fix (this is the default when
+            stdin is not a terminal)
+  -h, --help  show this help
+
+With no flag and an interactive terminal, you're prompted per problem:
+"Fix now? [y/N]".
+EOF
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        --fix) MODE="fix" ;;
+        --no-fix) MODE="nofix" ;;
+        -h|--help) usage; exit 0 ;;
+        *)
+            echo "unknown argument: $arg" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+if [ -z "$MODE" ]; then
+    if [ -t 0 ]; then
+        MODE="prompt"
+    else
+        MODE="nofix"
+    fi
+fi
 
 fail() {
     echo "FAIL: $*" >&2
@@ -23,10 +65,72 @@ info() {
 }
 
 # ---------------------------------------------------------------------------
+# offer_fix "description" "command" "fail|warn"
+#
+# Prints the command, then either applies it (--fix), prompts for it
+# (interactive default), or just reports it (--no-fix / non-interactive).
+# If root is needed and we're not root, prefixes with sudo when available;
+# with neither root nor sudo, prints the manual command and gives up.
+# Returns 0 if the problem is now fixed, 1 otherwise (and logs via
+# fail()/warn() per the given severity so callers don't have to).
+# ---------------------------------------------------------------------------
+offer_fix() {
+    desc="$1"
+    cmd="$2"
+    severity="$3"
+
+    if [ "$MODE" = "nofix" ]; then
+        if [ "$severity" = "fail" ]; then fail "$desc - fix: $cmd"; else warn "$desc - fix: $cmd"; fi
+        return 1
+    fi
+
+    if [ "$(id -u)" = "0" ]; then
+        run_cmd="$cmd"
+    elif command -v sudo >/dev/null 2>&1; then
+        run_cmd="sudo $cmd"
+    else
+        echo "MANUAL: $desc - run: $cmd" >&2
+        if [ "$severity" = "fail" ]; then fail "$desc - fix: $cmd"; else warn "$desc - fix: $cmd"; fi
+        return 1
+    fi
+
+    if [ "$MODE" = "fix" ]; then
+        apply=1
+    else
+        printf '%s\n  %s\n' "$desc" "$run_cmd"
+        printf 'Fix now? [y/N] '
+        if [ -r /dev/tty ]; then
+            read -r ans < /dev/tty
+        else
+            read -r ans
+        fi
+        case "$ans" in
+            [yY]*) apply=1 ;;
+            *) apply=0 ;;
+        esac
+    fi
+
+    if [ "$apply" = "1" ]; then
+        echo "Running: $run_cmd"
+        if sh -c "$run_cmd"; then
+            echo "OK: $desc"
+            return 0
+        fi
+        echo "FAILED: $desc"
+    else
+        echo "SKIPPED: $desc"
+    fi
+    if [ "$severity" = "fail" ]; then fail "$desc - fix: $cmd"; else warn "$desc - fix: $cmd"; fi
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 # Competing time daemons. Two steppers (a host daemon and the container)
 # fighting over the clock is one of the documented risks; both must be
 # inactive AND masked so a reboot doesn't silently bring one back.
 # ---------------------------------------------------------------------------
+DAEMON_UNITS="systemd-timesyncd.service chronyd.service ntpd.service ntp.service ntpsec.service"
+
 check_daemon() {
     unit="$1"
     if ! command -v systemctl >/dev/null 2>&1; then
@@ -35,7 +139,7 @@ check_daemon() {
     fi
 
     if systemctl is-active --quiet "$unit" 2>/dev/null; then
-        fail "$unit is active - stop it: systemctl disable --now $unit"
+        offer_fix "$unit is active" "systemctl disable --now $unit" fail
     fi
 
     if ! systemctl is-enabled --quiet "$unit" 2>/dev/null; then
@@ -45,20 +149,28 @@ check_daemon() {
                 info "$unit is masked"
                 ;;
             ""|not-found|disabled)
-                warn "$unit is not masked (state: ${state:-unknown}) - mask it: systemctl mask $unit"
+                offer_fix "$unit is not masked (state: ${state:-unknown})" "systemctl mask $unit" warn
                 ;;
             *)
-                warn "$unit is in unexpected state '$state' (not masked/disabled/not-found) - mask it: systemctl mask $unit"
+                offer_fix "$unit is in unexpected state '$state' (not masked/disabled/not-found)" "systemctl mask $unit" warn
                 ;;
         esac
     fi
 }
 
-check_daemon systemd-timesyncd.service
-check_daemon chronyd.service
-check_daemon ntpd.service
-check_daemon ntp.service
-check_daemon ntpsec.service
+for unit in $DAEMON_UNITS; do
+    check_daemon "$unit"
+done
+
+# Re-run once so a fix applied above (e.g. disabling an active daemon) is
+# reflected in the final exit status, not just in the fixed-at-the-time check.
+if command -v systemctl >/dev/null 2>&1; then
+    for unit in $DAEMON_UNITS; do
+        if systemctl is-active --quiet "$unit" 2>/dev/null; then
+            status=1
+        fi
+    done
+fi
 
 # ---------------------------------------------------------------------------
 # UDP 123 must be free for the container (network_mode: host).
@@ -66,7 +178,11 @@ check_daemon ntpsec.service
 if command -v ss >/dev/null 2>&1; then
     listeners=$(ss -lunp 2>/dev/null | awk 'NR>1 && $4 ~ /:123$/')
     if [ -n "$listeners" ]; then
-        fail "something is already listening on UDP 123:"
+        if echo "$listeners" | grep -Eq 'chronyd|ntpd|ntpsec|systemd-timesyncd'; then
+            fail "UDP 123 is still bound by a time daemon (see daemon checks above):"
+        else
+            fail "something is already listening on UDP 123 (no automatic fix):"
+        fi
         echo "$listeners" >&2
     else
         info "UDP 123 is free"
@@ -86,7 +202,7 @@ if command -v docker >/dev/null 2>&1; then
     elif [ "$driver" = "json-file" ] || [ "$driver" = "local" ]; then
         info "docker LoggingDriver is $driver"
     else
-        fail "docker LoggingDriver is '$driver', expected json-file or local"
+        fail "docker LoggingDriver is '$driver', expected json-file or local - not auto-fixable: set \"log-driver\": \"json-file\" in /etc/docker/daemon.json and restart docker"
     fi
 else
     warn "docker not found, cannot check LoggingDriver"
@@ -141,14 +257,13 @@ for d in data chrony-data; do
 done
 
 data_dir="$compose_dir/data"
-if [ "$(id -u)" = "0" ]; then
-    if chown 1000:1000 "$data_dir" 2>/dev/null; then
-        info "chowned $data_dir to 1000:1000"
-    else
-        warn "could not chown $data_dir - run: chown 1000:1000 $data_dir"
-    fi
+owner_uid=$(stat -c '%u' "$data_dir" 2>/dev/null || true)
+if [ -z "$owner_uid" ]; then
+    warn "could not determine ownership of $data_dir"
+elif [ "$owner_uid" = "1000" ]; then
+    info "$data_dir is owned by uid 1000"
 else
-    warn "not root - run this to fix ownership: sudo chown 1000:1000 $data_dir"
+    offer_fix "$data_dir is owned by uid $owner_uid, expected 1000" "chown 1000:1000 $data_dir" warn
 fi
 
 exit "$status"

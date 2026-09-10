@@ -26,7 +26,22 @@ from outside the host.
 ## Host prep (Orange Pi)
 
 Two time daemons fighting over the clock is the main failure mode — the host's own daemon
-must be off and masked before the container starts:
+must be off and masked before the container starts.
+
+Why: Linux does not namespace the system clock, so a container shares `CLOCK_REALTIME` with
+the host. The `chrony` container is granted `CAP_SYS_TIME` in `compose.yaml`, which lets
+chronyd call `adjtimex`/`settimeofday` on that shared clock — it *is* the host's time
+daemon, just packaged as a container. A second daemon (timesyncd, host chrony/ntpd) would
+steer the same clock toward its own sources and each would keep correcting the other's
+adjustments (drift oscillation, sources flagged as falsetickers, corrupted drift file). A
+host chronyd/ntpd would also contend for UDP 123 since the container uses `network_mode: host`.
+Mask rather than only disable: timesyncd gets re-enabled by systemd presets, package
+upgrades, and network-manager hooks.
+
+Dropping `SYS_TIME` is not a substitute. chronyd would then be unable to adjust the clock
+(`adjtimex failed: Operation not permitted`), would keep reporting an uncorrected offset,
+and would serve whatever time timesyncd's SNTP loop leaves on the clock — far less accurate
+than chrony disciplining against the grandmaster directly.
 
 ```sh
 sudo systemctl disable --now systemd-timesyncd.service
@@ -36,7 +51,9 @@ sudo systemctl mask chronyd.service ntpd.service ntp.service 2>/dev/null
 ```
 
 Then run the checker, which verifies all of the above plus UDP 123 is free, the Docker
-logging driver, and prints values you'll need for `.env`:
+logging driver, and prints values you'll need for `.env` — it can also apply the fixes
+above for you (`--fix` to apply without prompting, or run it interactively and answer
+`y` per problem; `--no-fix` to only check):
 
 ```sh
 scripts/check-host.sh
@@ -47,9 +64,9 @@ It reports:
   `/var/run/docker.sock` as an unprivileged user.
 - Docker's `LoggingDriver` must be `json-file` or `local` — Alloy's `discovery.docker` /
   `loki.source.docker` tail container stdout via the Docker API, which needs one of these.
-- `/sys/class/hwmon/*/name` entries — the Orange Pi's temperature sensor label varies by
-  board/kernel; pin the dashboard's Temperature panel query to whatever name is printed
-  here after import.
+- `/sys/class/hwmon/*/name` entries — the dashboard's Temperature panel is pinned to the
+  Orange Pi 5's hwmon names (`*_thermal` + `nvme`, matched on the `chip_name` label); on a
+  different board, use these names to edit the panel's `chip_name` regex.
 
 It also creates `./data` and `./chrony-data` next to the compose file if missing, and
 chowns `./data` to `1000:1000` (Alloy's container uid) when run as root.
@@ -201,6 +218,7 @@ metrics.
 - **Offset/stratum look wrong or clock is stepping unexpectedly**: check for a second time
   daemon still running on the host (`systemd-timesyncd`, `chronyd`, `ntpd`) — two steppers
   fighting is the most common cause; re-run `scripts/check-host.sh`.
-- **Temperature panel is empty**: the Orange Pi's hwmon label varies by board/kernel; run
-  `scripts/check-host.sh` (or `cat /sys/class/hwmon/*/name`) and edit the panel's query to
-  match the printed name.
+- **Temperature panel is empty**: the panel is pinned to the Orange Pi 5's hwmon names
+  (`node_hwmon_temp_celsius{chip_name=~".*_thermal|nvme"}`); on a different board, run
+  `scripts/check-host.sh` (or `cat /sys/class/hwmon/*/name`) and edit the panel's
+  `chip_name` regex to match the printed names.

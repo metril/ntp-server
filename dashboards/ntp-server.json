@@ -668,15 +668,9 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "node_hwmon_temp_celsius{host=\"$host\"}",
-          "legendFormat": "{{chip}} {{sensor}}",
+          "expr": "node_hwmon_temp_celsius{host=\"$host\", chip_name=~\".*_thermal|nvme\"}",
+          "legendFormat": "{{chip_name}}",
           "refId": "A"
-        },
-        {
-          "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "node_thermal_zone_temp{host=\"$host\"}",
-          "legendFormat": "zone {{zone}}",
-          "refId": "B"
         }
       ],
       "title": "Temperature",
