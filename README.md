@@ -68,8 +68,9 @@ It reports:
   Orange Pi 5's hwmon names (`*_thermal` + `nvme`, matched on the `chip_name` label); on a
   different board, use these names to edit the panel's `chip_name` regex.
 
-It also creates `./data` and `./chrony-data` next to the compose file if missing, and
-chowns `./data` to `1000:1000` (Alloy's container uid) when run as root.
+It also creates `./chrony-data` next to the compose file if missing. Alloy keeps its state
+(remote_write WAL, log positions) on a 256m tmpfs so it never writes to the Pi's storage;
+the cost is that samples buffered during a VictoriaMetrics outage don't survive a restart.
 
 ## Firewall / port-forward
 

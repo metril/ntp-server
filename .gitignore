@@ -1,5 +1,4 @@
 .env
-data/
 chrony-data/
 geoip/
 HANDOFF.md

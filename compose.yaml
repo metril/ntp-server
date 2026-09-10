@@ -98,14 +98,19 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./config:/etc/alloy:ro
-      # Not /var/lib/alloy/data: the image ships /var/lib/alloy as 0770 owned
-      # by its internal uid 473, so uid 1000 cannot traverse into a mount there.
-      - ./data:/alloy-data
       # Host filesystem/diskstats view (rslave so bind-mount propagation
       # events are visible read-only) - config.alloy points rootfs_path at
       # this. cpu/meminfo/netdev/hwmon don't need it: those already read the
       # host under network_mode: host / default /proc,/sys visibility.
       - /:/rootfs:ro,rslave
+
+    # Alloy's state (remote_write WAL, docker log positions, instance seed)
+    # lives in RAM, not on the Pi's storage. Lost on restart: samples buffered
+    # during a VictoriaMetrics outage and the log read positions (logs resume
+    # from the tail). Not /var/lib/alloy/data: the image ships /var/lib/alloy
+    # as 0770 owned by its internal uid 473, unreachable for uid 1000.
+    tmpfs:
+      - /alloy-data:uid=1000,gid=1000,mode=0700,size=256m
 
     command:
       - run

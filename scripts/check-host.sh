@@ -239,31 +239,18 @@ if [ "$found_hwmon" -eq 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Host bind-mount directories. ./data (alloy's storage.path, uid 1000 inside
-# the container) must exist and be writable by that uid before `docker
-# compose up` first creates the container; ./chrony-data doesn't need the
-# chown since the chrony container chowns it itself as root on start.
+# Host bind-mount directory. ./chrony-data must exist before `docker compose
+# up`; the chrony container chowns it itself as root on start. Alloy's state
+# is on a tmpfs, nothing to prepare.
 # ---------------------------------------------------------------------------
 compose_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-for d in data chrony-data; do
-    dir="$compose_dir/$d"
-    if [ ! -d "$dir" ]; then
-        if mkdir -p "$dir" 2>/dev/null; then
-            info "created $dir"
-        else
-            warn "could not create $dir - run: mkdir -p $dir"
-        fi
+dir="$compose_dir/chrony-data"
+if [ ! -d "$dir" ]; then
+    if mkdir -p "$dir" 2>/dev/null; then
+        info "created $dir"
+    else
+        warn "could not create $dir - run: mkdir -p $dir"
     fi
-done
-
-data_dir="$compose_dir/data"
-owner_uid=$(stat -c '%u' "$data_dir" 2>/dev/null || true)
-if [ -z "$owner_uid" ]; then
-    warn "could not determine ownership of $data_dir"
-elif [ "$owner_uid" = "1000" ]; then
-    info "$data_dir is owned by uid 1000"
-else
-    offer_fix "$data_dir is owned by uid $owner_uid, expected 1000" "chown 1000:1000 $data_dir" warn
 fi
 
 exit "$status"

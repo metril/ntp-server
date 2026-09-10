@@ -68,6 +68,13 @@ prometheus.remote_write "victoriametrics" {
 	external_labels = {
 		host = sys.env("ALLOY_INSTANCE"),
 	}
+
+	// WAL is on a 256m tmpfs (compose.yaml); keep it small so a long
+	// VictoriaMetrics outage can't fill it.
+	wal {
+		truncate_frequency = "30m"
+		max_keepalive_time = "1h"
+	}
 }
 
 // ---------------------------------------------------------------------------
