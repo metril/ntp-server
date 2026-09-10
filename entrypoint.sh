@@ -1,0 +1,161 @@
+#!/bin/sh
+# POSIX sh (busybox ash on alpine). Renders /tmp/chrony.conf from
+# chrony.conf.template + env, then execs chronyd in the background so this
+# script can watch for NTS cert/key changes while still propagating chronyd's
+# exit status (and forwarding TERM to it) for `restart: unless-stopped`.
+set -eu
+
+TEMPLATE=/etc/chrony/chrony.conf.template
+RENDERED=/tmp/chrony.conf
+# NTS_CERT_DIR is bind-mounted read-only at /certs by compose.nts.yaml;
+# NTS_CERT_NAME/NTS_KEY_NAME are paths relative to it (may include
+# subdirectories, e.g. "live/<host>/fullchain.pem" when NTS_CERT_DIR points
+# at the whole /etc/letsencrypt so live/'s symlinks into archive/ resolve).
+NTS_CERT_SRC="/certs/${NTS_CERT_NAME:-fullchain.pem}"
+NTS_KEY_SRC="/certs/${NTS_KEY_NAME:-privkey.pem}"
+NTS_KEY_TMP=/tmp/nts-server.key
+NTS_CERT_TMP=/tmp/nts-server.crt
+
+NTS_ENABLED="${NTS_ENABLED:-false}"
+NTS_CERT_CHECK_INTERVAL="${NTS_CERT_CHECK_INTERVAL:-60}"
+RATELIMIT_INTERVAL="${RATELIMIT_INTERVAL:-3}"
+RATELIMIT_BURST="${RATELIMIT_BURST:-8}"
+CLIENTLOGLIMIT="${CLIENTLOGLIMIT:-4194304}"
+POOL_SERVERS="${POOL_SERVERS:-}"
+
+if [ -z "${GRANDMASTER_HOST:-}" ]; then
+	echo "entrypoint: GRANDMASTER_HOST must be set" >&2
+	exit 1
+fi
+
+render_pool_servers() {
+	# One "server X iburst" line per whitespace-separated POOL_SERVERS entry.
+	out=""
+	for s in $POOL_SERVERS; do
+		out="${out}server ${s} iburst
+"
+	done
+	printf '%s' "$out"
+}
+
+render_nts_config() {
+	if [ "$NTS_ENABLED" != "true" ]; then
+		printf ''
+		return
+	fi
+	cat <<-EOF
+	ntsservercert ${NTS_CERT_TMP}
+	ntsserverkey ${NTS_KEY_TMP}
+	ntsport 4460
+	ntsdumpdir /var/lib/chrony
+	ntsprocesses 1
+	EOF
+}
+
+copy_nts_files() {
+	# Copy cert/key into /tmp with perms the dropped-priv `chrony` user can
+	# read (root:chrony 0640), since the host-mounted originals under
+	# /certs are read-only and may not be group-readable by chrony.
+	if [ ! -r "$NTS_CERT_SRC" ] || [ ! -r "$NTS_KEY_SRC" ]; then
+		echo "entrypoint: NTS cert/key files missing or unreadable at $NTS_CERT_SRC / $NTS_KEY_SRC" >&2
+		exit 1
+	fi
+	cp "$NTS_CERT_SRC" "$NTS_CERT_TMP"
+	cp "$NTS_KEY_SRC" "$NTS_KEY_TMP"
+	chown root:chrony "$NTS_CERT_TMP" "$NTS_KEY_TMP"
+	chmod 0640 "$NTS_CERT_TMP" "$NTS_KEY_TMP"
+}
+
+hash_nts_files() {
+	# Hash the ORIGINAL host-mounted files, not our /tmp copies, so we
+	# detect the external renewal.
+	md5sum "$NTS_CERT_SRC" "$NTS_KEY_SRC" 2>/dev/null | md5sum
+}
+
+render_config() {
+	pool_block="$(render_pool_servers)"
+	nts_block="$(render_nts_config)"
+	sed \
+		-e "s#\${GRANDMASTER_HOST}#${GRANDMASTER_HOST}#g" \
+		-e "s#\${RATELIMIT_INTERVAL}#${RATELIMIT_INTERVAL}#g" \
+		-e "s#\${RATELIMIT_BURST}#${RATELIMIT_BURST}#g" \
+		-e "s#\${CLIENTLOGLIMIT}#${CLIENTLOGLIMIT}#g" \
+		"$TEMPLATE" >"$RENDERED.tmp"
+	# Multi-line substitutions can't safely go through sed's s#..#..# above,
+	# so splice them in with awk instead.
+	awk -v pool="$pool_block" -v nts="$nts_block" '
+		{
+			if ($0 == "__POOL_SERVERS__") { printf "%s", pool; next }
+			if ($0 == "__NTS_CONFIG__") { printf "%s", nts; next }
+			print
+		}
+	' "$RENDERED.tmp" >"$RENDERED"
+	rm -f "$RENDERED.tmp"
+}
+
+render_config
+
+if [ "$NTS_ENABLED" = "true" ]; then
+	copy_nts_files
+fi
+
+# Fresh bind mounts (./chrony-data, the chrony-run volume) come up
+# root-owned; chronyd runs as chrony:chrony after dropping privs and needs
+# to write drift/rtc/nts-dump files and create its command socket.
+chown -R chrony:chrony /var/lib/chrony
+mkdir -p /run/chrony
+chown chrony:chrony /run/chrony
+chmod 0750 /run/chrony
+
+CHRONYD_PID=""
+
+forward_term() {
+	if [ -n "$CHRONYD_PID" ]; then
+		kill -TERM "$CHRONYD_PID" 2>/dev/null || true
+		# Wait for chronyd to actually exit before this script exits, so
+		# `docker stop` doesn't tear down the container (and the shared
+		# chrony-run volume's socket) out from under a still-running chronyd.
+		waited=0
+		while kill -0 "$CHRONYD_PID" 2>/dev/null; do
+			[ "$waited" -ge 10000 ] && break
+			sleep 0.2
+			waited=$((waited + 200))
+		done
+	fi
+}
+trap forward_term TERM INT
+
+chronyd -d -f "$RENDERED" &
+CHRONYD_PID=$!
+
+if [ "$NTS_ENABLED" = "true" ]; then
+	# chrony 4.5 cannot hot-reload ntsservercert/ntsserverkey ("chronyd
+	# needs to be restarted in order to load a renewed certificate" -
+	# chrony-project.org/doc/4.5/chrony.conf.html; chronyc rekey only
+	# reloads externally-managed NTS server keys, not this TLS cert/key
+	# pair). So on change we just exit and let `restart: unless-stopped`
+	# bring chronyd back up with the new files. NTS-KE cookies survive via
+	# ntsdumpdir.
+	(
+		prev_hash="$(hash_nts_files)"
+		while true; do
+			sleep "$NTS_CERT_CHECK_INTERVAL"
+			if ! kill -0 "$CHRONYD_PID" 2>/dev/null; then
+				exit 0
+			fi
+			cur_hash="$(hash_nts_files)"
+			if [ "$cur_hash" != "$prev_hash" ]; then
+				echo "entrypoint: NTS cert/key changed, restarting chronyd to load it"
+				copy_nts_files
+				kill -TERM "$CHRONYD_PID" 2>/dev/null || true
+				exit 0
+			fi
+		done
+	) &
+fi
+
+set +e
+wait "$CHRONYD_PID"
+STATUS=$?
+set -e
+exit "$STATUS"

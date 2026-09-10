@@ -1,0 +1,29 @@
+# Rendered by entrypoint.sh - do not edit the container's copy directly.
+
+server ${GRANDMASTER_HOST} iburst minpoll 4 maxpoll 6 prefer
+
+# Fallbacks so a bad/unreachable grandmaster gets outvoted (>=3 sources total).
+server time.cloudflare.com iburst
+server time.nist.gov iburst
+pool 2.pool.ntp.org iburst maxsources 2
+__POOL_SERVERS__
+
+driftfile /var/lib/chrony/drift
+makestep 1.0 3
+leapsectz right/UTC
+# rtcsync
+# ^ commented: Orange Pi often has no RTC.
+
+# Serving.
+allow all
+ratelimit interval ${RATELIMIT_INTERVAL} burst ${RATELIMIT_BURST} leak 2
+clientloglimit ${CLIENTLOGLIMIT}
+# Never noclientlog - it kills ratelimit and the clients metrics.
+
+# Control (unix socket only - shared with chrony-exporter via the
+# chrony-run volume; serverstats/clients metrics require this socket,
+# chronyd refuses them over the UDP cmdport).
+bindcmdaddress /run/chrony/chronyd.sock
+cmdport 0
+
+__NTS_CONFIG__

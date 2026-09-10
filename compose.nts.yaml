@@ -1,0 +1,18 @@
+# Overlay enabling NTS. Usage:
+#   docker compose -f compose.yaml -f compose.nts.yaml up -d
+# Requires NTS_ENABLED=true and NTS_CERT_DIR set in .env (NTS_CERT_NAME /
+# NTS_KEY_NAME only if your filenames/layout differ from the defaults).
+#
+# A directory is mounted, not individual cert/key files: certbot renewal
+# replaces /etc/letsencrypt/live/<host>/*.pem by writing new files into
+# archive/<host>/ and repointing the live/<host>/ symlinks - a file-level
+# bind mount would keep the old inode forever (renewal silently ignored).
+# live/<host>/*.pem are themselves relative symlinks into ../../archive/,
+# so if NTS_CERT_DIR only covers live/<host> those symlinks dangle inside
+# the container. Simplest fix: point NTS_CERT_DIR at /etc/letsencrypt
+# itself (both live/ and archive/ come along), and let NTS_CERT_NAME /
+# NTS_KEY_NAME include the "live/<host>/" prefix - see .env.example.
+services:
+  chrony:
+    volumes:
+      - ${NTS_CERT_DIR:?set NTS_CERT_DIR in .env}:/certs:ro

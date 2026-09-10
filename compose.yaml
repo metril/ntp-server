@@ -1,0 +1,119 @@
+services:
+  chrony:
+    build: .
+    container_name: chrony
+    restart: unless-stopped
+    network_mode: host
+
+    environment:
+      GRANDMASTER_HOST: ${GRANDMASTER_HOST:?set GRANDMASTER_HOST in .env}
+      POOL_SERVERS: ${POOL_SERVERS:-}
+      RATELIMIT_INTERVAL: ${RATELIMIT_INTERVAL:-3}
+      RATELIMIT_BURST: ${RATELIMIT_BURST:-8}
+      CLIENTLOGLIMIT: ${CLIENTLOGLIMIT:-4194304}
+      NTS_ENABLED: ${NTS_ENABLED:-false}
+      NTS_CERT_CHECK_INTERVAL: ${NTS_CERT_CHECK_INTERVAL:-60}
+
+    volumes:
+      - ./chrony-data:/var/lib/chrony
+      - chrony-run:/run/chrony
+
+    # Alpine chronyd binds ports then drops privs to the `chrony` user.
+    # Trim these after testing on the Pi if some prove unnecessary.
+    cap_drop:
+      - ALL
+    cap_add:
+      - SYS_TIME
+      - NET_BIND_SERVICE
+      - SETUID
+      - SETGID
+      - CHOWN
+      - DAC_OVERRIDE
+
+    security_opt:
+      - no-new-privileges:true
+
+    healthcheck:
+      # No "-h 127.0.0.1": chronyc defaults to the unix command socket at
+      # /run/chrony/chronyd.sock, which this container also has mounted.
+      test: ["CMD", "chronyc", "tracking"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  chrony-exporter:
+    image: ghcr.io/superq/chrony_exporter:latest
+    container_name: chrony-exporter
+    restart: unless-stopped
+    network_mode: host
+    # Must match the `chrony` user (uid:gid) baked into the chrony image so
+    # this container can read the chronyd unix socket under /run/chrony
+    # (0660, owned by chrony:chrony). Verify after any base-image bump with:
+    #   docker build -t ntp-server . && docker run --rm --entrypoint sh ntp-server -c 'id chrony'
+    # Alpine 3.20's `chrony` package currently yields uid=100 gid=101.
+    user: "100:101"
+
+    volumes:
+      - chrony-run:/run/chrony
+
+    command:
+      # serverstats/clients require the unix command socket - chronyd
+      # rejects them over the UDP cmdport.
+      - --chrony.address=unix:///run/chrony/chronyd.sock
+      - --web.listen-address=127.0.0.1:9123
+      - --collector.clients
+      - --no-collector.dns-lookups
+
+    depends_on:
+      chrony:
+        condition: service_healthy
+
+    security_opt:
+      - no-new-privileges:true
+
+  alloy:
+    image: grafana/alloy:latest
+    container_name: alloy
+    restart: unless-stopped
+    network_mode: host
+    user: "1000:1000"
+    group_add:
+      - "${DOCKER_GID:?set DOCKER_GID in .env}"
+
+    env_file: .env
+
+    environment:
+      ALLOY_INSTANCE: ${ALLOY_INSTANCE:?set ALLOY_INSTANCE in .env}
+      VM_URL: ${VM_URL:?set VM_URL in .env}
+      VM_USER: ${VM_USER:?set VM_USER in .env}
+      VM_PASSWORD: ${VM_PASSWORD:?set VM_PASSWORD in .env}
+      VL_URL: ${VL_URL:?set VL_URL in .env}
+      VL_USER: ${VL_USER:?set VL_USER in .env}
+      VL_PASSWORD: ${VL_PASSWORD:?set VL_PASSWORD in .env}
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./config:/etc/alloy:ro
+      - ./data:/var/lib/alloy/data
+      # Host filesystem/diskstats view (rslave so bind-mount propagation
+      # events are visible read-only) - config.alloy points rootfs_path at
+      # this. cpu/meminfo/netdev/hwmon don't need it: those already read the
+      # host under network_mode: host / default /proc,/sys visibility.
+      - /:/rootfs:ro,rslave
+
+    command:
+      - run
+      - --server.http.listen-addr=127.0.0.1:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+
+    depends_on:
+      chrony-exporter:
+        condition: service_started
+
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  chrony-run:

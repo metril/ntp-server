@@ -1,0 +1,122 @@
+// ntp-server: Alloy sidecar collecting host + chrony metrics and container
+// logs, forwarding to VictoriaMetrics (remote_write) and VictoriaLogs (Loki
+// push). Mirrors the conventions of ~/projects/grafana-alloy/config/config.alloy.
+
+logging {
+	level  = "info"
+	format = "logfmt"
+}
+
+// ---------------------------------------------------------------------------
+// Host metrics.
+//
+// cpu/meminfo/netdev/hwmon/thermal_zone/loadavg/uname all read from
+// container-local /proc and /sys, which already reflect the real host here
+// (network_mode: host, no PID/UTS namespacing) - no extra mount needed.
+// filesystem/diskstats are different: those read the container's root
+// mounts, which are the overlay/tmpfs layers of the container image, NOT
+// the host's disks. compose.yaml bind-mounts the host root at /rootfs:ro
+// (rslave) so these two collectors can see real host filesystems via
+// rootfs_path below. set_collectors (not enable_collectors) is used so the
+// exact list below is authoritative rather than layered on top of the
+// exporter's own defaults.
+// ---------------------------------------------------------------------------
+prometheus.exporter.unix "host" {
+	rootfs_path = "/rootfs"
+
+	set_collectors = [
+		"cpu",
+		"meminfo",
+		"netdev",
+		"diskstats",
+		"filesystem",
+		"hwmon",
+		"thermal_zone",
+		"loadavg",
+		"uname",
+	]
+}
+
+prometheus.scrape "host" {
+	targets         = prometheus.exporter.unix.host.targets
+	forward_to      = [prometheus.remote_write.victoriametrics.receiver]
+	job_name        = "node"
+	scrape_interval = "30s"
+}
+
+// chrony_exporter runs in its own container, bound to loopback per compose.yaml.
+prometheus.scrape "chrony" {
+	targets = [
+		{"__address__" = "127.0.0.1:9123"},
+	]
+
+	forward_to      = [prometheus.remote_write.victoriametrics.receiver]
+	job_name        = "chrony"
+	scrape_interval = "15s"
+}
+
+prometheus.remote_write "victoriametrics" {
+	endpoint {
+		url = sys.env("VM_URL")
+
+		basic_auth {
+			username = sys.env("VM_USER")
+			password = sys.env("VM_PASSWORD")
+		}
+	}
+
+	external_labels = {
+		host = sys.env("ALLOY_INSTANCE"),
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Container logs.
+//
+// Only the chrony container's stdout matters here (compose runs chrony,
+// chrony-exporter, alloy); all are labeled job="ntp-server" so the dashboard
+// query stays a single selector regardless of which container emitted the
+// line. 'container' strips the leading "/" Docker puts on
+// __meta_docker_container_name.
+// ---------------------------------------------------------------------------
+discovery.docker "containers" {
+	host = "unix:///var/run/docker.sock"
+}
+
+discovery.relabel "containers" {
+	targets = discovery.docker.containers.targets
+
+	rule {
+		source_labels = ["__meta_docker_container_name"]
+		regex         = "^/(.*)$"
+		target_label  = "container"
+	}
+
+	rule {
+		target_label = "job"
+		replacement  = "ntp-server"
+	}
+
+	rule {
+		target_label = "host"
+		replacement  = sys.env("ALLOY_INSTANCE")
+	}
+}
+
+loki.source.docker "containers" {
+	host          = "unix:///var/run/docker.sock"
+	targets       = discovery.relabel.containers.output
+	relabel_rules = discovery.relabel.containers.rules
+	forward_to    = [loki.write.victorialogs.receiver]
+}
+
+loki.write "victorialogs" {
+	endpoint {
+		url = sys.env("VL_URL")
+
+		basic_auth {
+			username = sys.env("VL_USER")
+			password = sys.env("VL_PASSWORD")
+		}
+	}
+}
