@@ -102,9 +102,11 @@ fi
 # root-owned; chronyd runs as chrony:chrony after dropping privs and needs
 # to write drift/rtc/nts-dump files and create its command socket.
 chown -R chrony:chrony /var/lib/chrony
+# chmod before chown: once the dir is chrony-owned, chmod as root needs
+# CAP_FOWNER, which compose drops (cap_drop: ALL).
 mkdir -p /run/chrony
-chown chrony:chrony /run/chrony
 chmod 0750 /run/chrony
+chown chrony:chrony /run/chrony
 
 CHRONYD_PID=""
 
