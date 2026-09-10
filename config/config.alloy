@@ -81,10 +81,9 @@ prometheus.remote_write "victoriametrics" {
 // ---------------------------------------------------------------------------
 // Container logs.
 //
-// Only containers from this compose project (ntp-server) are shipped;
-// discovery.docker sees every container on the Docker host, so a keep rule
-// below restricts to com.docker.compose.project=ntp-server before anything
-// else. Within that project all are labeled job="ntp-server" so the
+// Only this stack's three containers are shipped; discovery.docker sees
+// every container on the Docker host, so a keep rule below restricts to the
+// container_names compose.yaml pins before anything else. Within that project all are labeled job="ntp-server" so the
 // dashboard query stays a single selector regardless of which container
 // emitted the line. 'container' strips the leading "/" Docker puts on
 // __meta_docker_container_name.
@@ -96,9 +95,13 @@ discovery.docker "containers" {
 discovery.relabel "containers" {
 	targets = discovery.docker.containers.targets
 
+	// Keyed on the fixed container_name values compose.yaml pins, not on the
+	// compose project label: the project name is the checkout directory's
+	// name unless overridden, so a differently named clone on the host would
+	// silently drop every line - including Alloy's own.
 	rule {
-		source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
-		regex         = "ntp-server"
+		source_labels = ["__meta_docker_container_name"]
+		regex         = "/(chrony|chrony-exporter|alloy)"
 		action        = "keep"
 	}
 
