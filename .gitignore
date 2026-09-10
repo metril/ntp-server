@@ -4,3 +4,4 @@ geoip/
 HANDOFF.md
 *.handoff.md
 notes/
+*.mcp.json
