@@ -1,6 +1,7 @@
 import socket
-import struct
 from types import SimpleNamespace
+
+import pytest
 
 import exporter
 from exporter import PacketCollector
@@ -119,3 +120,94 @@ def test_hourly_bucket_is_reset_when_the_wall_hour_changes():
     c.handle_frame(request_frame("192.0.2.14"))
     assert c._hour == 1
     assert c._hourly[1].count() >= 1
+
+
+def test_current_bucket_clears_all_skipped_hours_on_a_multi_hour_jump():
+    clock = FakeClock()
+    hour = [3]
+    c = PacketCollector(fake_geo(), 25, lambda: None, clock=clock, wall=lambda: hour[0] * 3600.0)
+    c.handle_frame(request_frame("192.0.2.20"))
+    assert c._hourly[3].count() >= 1
+
+    # Simulate stale same-hour-yesterday data sitting in the buckets that a
+    # multi-hour jump skips over.
+    for h in (4, 5, 6):
+        c._hourly[h].add("stale-yesterday")
+        assert c._hourly[h].count() >= 1
+
+    hour[0] = 7
+    c.handle_frame(request_frame("192.0.2.21"))
+
+    assert c._hour == 7
+    for h in (4, 5, 6):
+        assert c._hourly[h].count() == 0  # cleared, not left stale
+    assert c._hourly[7].count() >= 1
+    assert c._hourly[3].count() >= 1  # untouched buckets keep their data
+
+
+# --- open_capture_socket ---------------------------------------------------
+
+
+def test_open_capture_socket_attaches_filter_and_returns_the_socket(monkeypatch):
+    setsockopt_calls = []
+
+    class FakeSock:
+        def setsockopt(self, level, optname, value):
+            setsockopt_calls.append((level, optname))
+
+        def settimeout(self, t):
+            self.timeout = t
+
+        def close(self):
+            pass
+
+    fake = FakeSock()
+    monkeypatch.setattr(exporter.socket, "socket", lambda *a, **k: fake)
+
+    result = exporter.open_capture_socket()
+
+    assert result is fake
+    assert (socket.SOL_SOCKET, exporter.SO_ATTACH_FILTER) in setsockopt_calls
+    assert fake.timeout == 1.0
+
+
+# --- run_forever -------------------------------------------------------
+
+
+def test_run_forever_recovers_from_a_sock_factory_error(monkeypatch):
+    clock = FakeClock()
+    sleeps = []
+    monkeypatch.setattr(exporter.time, "sleep", lambda s: sleeps.append(s))
+
+    class StopCapture(Exception):
+        pass
+
+    class FakeSock:
+        def recv(self, n):
+            raise StopCapture()
+
+        def close(self):
+            pass
+
+    attempts = [0]
+
+    def factory():
+        attempts[0] += 1
+        if attempts[0] == 1:
+            raise RuntimeError("boom")  # non-OSError: exercises the widened except
+        return FakeSock()
+
+    c = PacketCollector(fake_geo(), 25, factory, clock=clock, wall=lambda: 0.0)
+
+    success_values = []
+    monkeypatch.setattr(
+        exporter.ntp_clients_scrape_success,
+        "set",
+        lambda v: success_values.append(v),
+    )
+
+    with pytest.raises(StopCapture):
+        c.run_forever(15)
+
+    assert sleeps == [30]
+    assert success_values == [0, 1]

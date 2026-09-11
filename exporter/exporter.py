@@ -490,7 +490,7 @@ def open_capture_socket():
     """Open an unbound AF_PACKET/SOCK_RAW socket filtered to udp port 123."""
     sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
     try:
-        sock._ntp_bpf = attach_filter(sock, build_ntp_bpf())  # keep buffer alive
+        attach_filter(sock, build_ntp_bpf())  # buffer only needs to outlive setsockopt
         sock.settimeout(1.0)
     except Exception:
         sock.close()
@@ -524,7 +524,15 @@ class PacketCollector:
         if self._hour is None:
             self._hour = hour
         elif hour != self._hour:
-            self._hourly[hour] = HyperLogLog()  # drop yesterday's same-hour data
+            # Clear every bucket skipped since the last update (quiet period
+            # or capture socket down), not just the newly-current one, so a
+            # multi-hour gap can't leave stale same-hour-yesterday data.
+            h = (self._hour + 1) % 24
+            while True:
+                self._hourly[h] = HyperLogLog()
+                if h == hour:
+                    break
+                h = (h + 1) % 24
             self._hour = hour
         return self._hourly[hour]
 
@@ -582,7 +590,7 @@ class PacketCollector:
             if sock is None:
                 try:
                     sock = self._sock_factory()
-                except OSError:
+                except Exception:
                     log.exception("failed to open NTP capture socket; retrying in 30s")
                     ntp_clients_scrape_success.set(0)
                     time.sleep(30)
