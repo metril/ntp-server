@@ -424,6 +424,13 @@ ntppool_scrape_success = Gauge(
 )
 
 
+ntp_geoip_database_loaded = Gauge(
+    "ntp_geoip_database_loaded",
+    "1 if the GeoLite2 mmdb is open and readable",
+    ["db"],
+)
+
+
 # --- GeoIP reader with reopen-on-mtime + LRU cache ----------------------
 
 
@@ -442,49 +449,59 @@ class GeoIPResolver:
         self._asn_reader = None
         self._country_mtime = None
         self._asn_mtime = None
+        self._country_missing_warned = False
+        self._asn_missing_warned = False
         self._cache_size = cache_size
         self._resolve_cached = lru_cache(maxsize=cache_size)(self._resolve_uncached)
         self._clock = clock
         self._last_reopen_check = None
 
-    def _reopen_if_needed(self):
+    def _reopen_one(self, path, reader, mtime_attr, missing_warned_attr, db_label):
+        old_mtime = getattr(self, mtime_attr)
         try:
-            mtime = os.path.getmtime(self._country_path)
-        except OSError:
-            mtime = None
-        if mtime != self._country_mtime:
-            self._country_mtime = mtime
-            old_reader = self._country_reader
+            mtime = os.path.getmtime(path)
+        except OSError as exc:
+            setattr(self, mtime_attr, None)
+            if reader is None and not getattr(self, missing_warned_attr):
+                log.warning("GeoIP database missing: %s (%s)", path, exc)
+                setattr(self, missing_warned_attr, True)
+            ntp_geoip_database_loaded.labels(db=db_label).set(1 if reader is not None else 0)
+            return reader
+
+        setattr(self, missing_warned_attr, False)
+        if mtime != old_mtime:
+            setattr(self, mtime_attr, mtime)
+            old_reader = reader
             try:
-                self._country_reader = self._maxminddb.open_database(self._country_path)
+                reader = self._maxminddb.open_database(path)
             except Exception:
-                log.warning("failed to open %s", self._country_path)
-                self._country_reader = None
+                log.warning("failed to open %s", path)
+                reader = None
             if old_reader is not None:
                 try:
                     old_reader.close()
                 except Exception:
-                    log.warning("failed to close old %s reader", self._country_path)
+                    log.warning("failed to close old %s reader", path)
             self._resolve_cached.cache_clear()
 
-        try:
-            mtime = os.path.getmtime(self._asn_path)
-        except OSError:
-            mtime = None
-        if mtime != self._asn_mtime:
-            self._asn_mtime = mtime
-            old_reader = self._asn_reader
-            try:
-                self._asn_reader = self._maxminddb.open_database(self._asn_path)
-            except Exception:
-                log.warning("failed to open %s", self._asn_path)
-                self._asn_reader = None
-            if old_reader is not None:
-                try:
-                    old_reader.close()
-                except Exception:
-                    log.warning("failed to close old %s reader", self._asn_path)
-            self._resolve_cached.cache_clear()
+        ntp_geoip_database_loaded.labels(db=db_label).set(1 if reader is not None else 0)
+        return reader
+
+    def _reopen_if_needed(self):
+        self._country_reader = self._reopen_one(
+            self._country_path,
+            self._country_reader,
+            "_country_mtime",
+            "_country_missing_warned",
+            "country",
+        )
+        self._asn_reader = self._reopen_one(
+            self._asn_path,
+            self._asn_reader,
+            "_asn_mtime",
+            "_asn_missing_warned",
+            "asn",
+        )
 
     def _country_lookup(self, ip):
         return self._country_reader.get(ip) if self._country_reader else None

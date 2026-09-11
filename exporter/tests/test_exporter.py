@@ -175,3 +175,44 @@ def test_resolve_only_stats_the_mtime_every_reopen_check_interval(monkeypatch, t
     t[0] += exporter.GEOIP_REOPEN_CHECK_SECONDS
     resolver.resolve("203.0.113.3")
     assert len(getmtime_calls) == 4
+
+
+def _loaded(db):
+    return exporter.ntp_geoip_database_loaded.labels(db=db)._value.get()
+
+
+def test_missing_geoip_dbs_log_once_and_set_gauge_zero(tmp_path, caplog):
+    t = [1000.0]
+    resolver = GeoIPResolver(str(tmp_path), clock=lambda: t[0])
+
+    with caplog.at_level("WARNING"):
+        resolver.resolve("203.0.113.1")
+
+    assert _loaded("country") == 0
+    assert _loaded("asn") == 0
+    missing_records = [r for r in caplog.records if "GeoIP database missing" in r.message]
+    assert len(missing_records) == 2  # one per db, on first check
+
+    caplog.clear()
+    t[0] += exporter.GEOIP_REOPEN_CHECK_SECONDS
+    with caplog.at_level("WARNING"):
+        resolver.resolve("203.0.113.2")
+
+    assert not [r for r in caplog.records if "GeoIP database missing" in r.message]
+
+
+def test_geoip_db_appearing_sets_gauge_to_one(tmp_path):
+    t = [1000.0]
+    resolver = GeoIPResolver(str(tmp_path), clock=lambda: t[0])
+
+    resolver.resolve("203.0.113.1")
+    assert _loaded("country") == 0
+
+    country_path = os.path.join(str(tmp_path), "GeoLite2-Country.mmdb")
+    open(country_path, "w").close()
+    resolver._maxminddb = SimpleNamespace(open_database=lambda path: SimpleNamespace(close=lambda: None))
+
+    t[0] += exporter.GEOIP_REOPEN_CHECK_SECONDS
+    resolver.resolve("203.0.113.2")
+
+    assert _loaded("country") == 1

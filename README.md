@@ -226,6 +226,8 @@ skew and any kernel capture loss (see `ntp_capture_kernel_drops_total`);
 `ntp_clients_scrape_success` is 1 while the capture socket is open.
 `ntp_capture_packets_total{direction}`, `ntp_capture_parse_errors_total`,
 `ntp_capture_loop_errors_total`, and `ntp_capture_kernel_drops_total` are self-monitoring.
+`ntp_geoip_database_loaded{db="country"|"asn"}` is 1 while the corresponding GeoLite2 mmdb
+is open and readable, 0 if it's missing or failed to open.
 Separately the sidecar polls `ntppool.org`'s public score JSON (`ntppool_score`,
 `ntppool_monitor_score`, `ntppool_monitor_offset_seconds`, `ntppool_monitor_rtt_seconds`).
 Both feed the dashboard's Clients and pool.ntp.org rows. NTS-KE (TCP 4460) is not captured.
