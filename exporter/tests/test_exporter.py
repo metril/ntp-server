@@ -6,11 +6,8 @@ import pytest
 
 import exporter
 from exporter import (
-    ClientsCollector,
     GeoIPResolver,
-    compute_deltas,
     fold_asn,
-    parse_clients_csv,
     parse_ntppool,
     parse_ntppool_overall_score,
     resolve_geo,
@@ -23,58 +20,6 @@ FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
 def read_fixture(name):
     with open(os.path.join(FIXTURES, name)) as f:
         return f.read()
-
-
-# --- parse_clients_csv ----------------------------------------------------
-
-
-def test_parse_clients_csv_skips_header_and_blank_and_malformed_rows():
-    rows = parse_clients_csv(read_fixture("clients.csv"))
-    addrs = [r["addr"] for r in rows]
-    assert addrs == ["203.0.113.5", "198.51.100.9", "2001:db8::1"]
-
-
-def test_parse_clients_csv_parses_ipv6_and_numeric_fields():
-    rows = parse_clients_csv(read_fixture("clients.csv"))
-    v6 = next(r for r in rows if r["addr"] == "2001:db8::1")
-    assert v6["ntp_pkts"] == 15
-    assert v6["ntp_drops"] == 1
-    assert v6["cmd_last"] == -1
-
-
-def test_parse_clients_csv_ignores_wrong_column_count():
-    rows = parse_clients_csv("1.2.3.4,1,2,3\n")
-    assert rows == []
-
-
-# --- compute_deltas --------------------------------------------------------
-
-
-def test_compute_deltas_normal_increase():
-    prev = {"1.1.1.1": (100, 1)}
-    curr = {"1.1.1.1": (150, 3)}
-    assert compute_deltas(prev, curr) == {"1.1.1.1": (50, 2)}
-
-
-def test_compute_deltas_new_ip_full_value_is_delta():
-    prev = {}
-    curr = {"1.1.1.1": (10, 0)}
-    assert compute_deltas(prev, curr) == {"1.1.1.1": (10, 0)}
-
-
-def test_compute_deltas_reset_treats_current_as_full_delta():
-    # counter went backwards: eviction/chronyd restart
-    prev = {"1.1.1.1": (500, 5)}
-    curr = {"1.1.1.1": (20, 1)}
-    assert compute_deltas(prev, curr) == {"1.1.1.1": (20, 1)}
-
-
-def test_compute_deltas_drops_ips_absent_from_current_poll():
-    prev = {"1.1.1.1": (10, 0), "2.2.2.2": (5, 0)}
-    curr = {"1.1.1.1": (12, 0)}
-    result = compute_deltas(prev, curr)
-    assert "2.2.2.2" not in result
-    assert result == {"1.1.1.1": (2, 0)}
 
 
 # --- resolve_geo -----------------------------------------------------------
@@ -177,36 +122,6 @@ def test_parse_ntppool_overall_score_uses_newest_entry_monitor_id_optional():
 
 def test_parse_ntppool_overall_score_empty_history():
     assert parse_ntppool_overall_score({"monitors": [], "history": []}) is None
-
-
-# --- ClientsCollector first-poll seeding -------------------------------------
-
-
-def test_clients_collector_first_poll_seeds_state_without_incrementing(monkeypatch):
-    csv_first = "203.0.113.5,100000,500,0,0,-1,10,0,0,-1\n"
-    monkeypatch.setattr(
-        exporter.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=csv_first)
-    )
-    fake_geo = SimpleNamespace(resolve=lambda ip: ("US", "NA", 1234, "TestOrg"))
-    collector = ClientsCollector("chronyc", fake_geo, 25)
-
-    requests_metric = exporter.ntp_client_requests_total.labels(country="US", continent="NA")
-    before = requests_metric._value.get()
-
-    collector.poll_once()
-
-    assert requests_metric._value.get() == before  # cumulative history not injected as a delta
-    assert collector._prev == {"203.0.113.5": (100000, 500)}
-    assert exporter.ntp_clients_active._value.get() == 1
-    assert exporter.ntp_clients_scrape_success._value.get() == 1
-
-    csv_second = "203.0.113.5,100010,501,0,0,-1,10,0,0,-1\n"
-    monkeypatch.setattr(
-        exporter.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=csv_second)
-    )
-    collector.poll_once()
-
-    assert requests_metric._value.get() == before + 10  # only the real second-poll increment
 
 
 # --- GeoIPResolver reader lifecycle -------------------------------------------

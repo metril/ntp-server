@@ -1,0 +1,121 @@
+import socket
+import struct
+from types import SimpleNamespace
+
+import exporter
+from exporter import PacketCollector
+
+from test_capture import eth, ipv4, udp
+
+
+class FakeClock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+    def advance(self, dt):
+        self.t += dt
+
+
+def fake_geo(asn=64500, org="TestOrg"):
+    return SimpleNamespace(resolve=lambda ip: ("US", "NA", asn, org))
+
+
+def request_frame(ip="203.0.113.5"):
+    return eth(ipv4(ip, "198.51.100.1", udp(41234, 123)))
+
+
+def response_frame(ip="203.0.113.5"):
+    return eth(ipv4("198.51.100.1", ip, udp(123, 41234)))
+
+
+def counter(metric, **labels):
+    return metric.labels(**labels)._value.get()
+
+
+def make(clock, asn=64500, org="TestOrg"):
+    return PacketCollector(fake_geo(asn, org), 25, lambda: None, clock=clock, wall=lambda: 0.0)
+
+
+def test_flush_publishes_requests_and_floors_drops_at_the_difference():
+    clock = FakeClock()
+    c = make(clock, asn=64501, org="OrgA")
+    before_req = counter(exporter.ntp_client_requests_total, country="US", continent="NA")
+    before_drop = counter(exporter.ntp_client_drops_total, country="US", continent="NA")
+
+    for _ in range(3):
+        c.handle_frame(request_frame())
+    c.handle_frame(response_frame())
+    c.flush()
+
+    assert counter(exporter.ntp_client_requests_total, country="US", continent="NA") == before_req + 3
+    assert counter(exporter.ntp_client_drops_total, country="US", continent="NA") == before_drop + 2
+    assert exporter.ntp_clients_active._value.get() == 1
+    assert exporter.ntp_clients_unique_daily._value.get() >= 1
+
+
+def test_more_responses_than_requests_never_produces_negative_drops():
+    clock = FakeClock()
+    c = make(clock, asn=64502, org="OrgB")
+    before = counter(exporter.ntp_client_drops_total, country="US", continent="NA")
+    c.handle_frame(request_frame("198.51.100.7"))
+    c.handle_frame(response_frame("198.51.100.7"))
+    c.handle_frame(response_frame("198.51.100.7"))
+    c.flush()
+    assert counter(exporter.ntp_client_drops_total, country="US", continent="NA") == before
+
+
+def test_active_gauge_evicts_entries_older_than_the_window():
+    clock = FakeClock()
+    c = make(clock, asn=64503, org="OrgC")
+    c.handle_frame(request_frame("192.0.2.10"))
+    c.flush()
+    assert exporter.ntp_clients_active._value.get() == 1
+
+    clock.advance(301)
+    c.flush()
+    assert exporter.ntp_clients_active._value.get() == 0
+
+
+def test_asn_counter_uses_the_top_n_fold():
+    clock = FakeClock()
+    c = make(clock, asn=64504, org="OrgD")
+    before = counter(exporter.ntp_client_requests_by_asn_total, asn="64504", as_org="OrgD")
+    c.handle_frame(request_frame("192.0.2.11"))
+    c.flush()
+    assert counter(exporter.ntp_client_requests_by_asn_total, asn="64504", as_org="OrgD") == before + 1
+
+
+def test_unparseable_frame_increments_the_parse_error_counter():
+    clock = FakeClock()
+    c = make(clock, asn=64505, org="OrgE")
+    before = exporter.ntp_capture_parse_errors_total._value.get()
+    c.handle_frame(b"\x00" * 10)
+    assert exporter.ntp_capture_parse_errors_total._value.get() == before + 1
+
+
+def test_capture_packet_counter_is_labelled_by_direction():
+    clock = FakeClock()
+    c = make(clock, asn=64506, org="OrgF")
+    before_req = counter(exporter.ntp_capture_packets_total, direction="request")
+    before_resp = counter(exporter.ntp_capture_packets_total, direction="response")
+    c.handle_frame(request_frame("192.0.2.12"))
+    c.handle_frame(response_frame("192.0.2.12"))
+    assert counter(exporter.ntp_capture_packets_total, direction="request") == before_req + 1
+    assert counter(exporter.ntp_capture_packets_total, direction="response") == before_resp + 1
+
+
+def test_hourly_bucket_is_reset_when_the_wall_hour_changes():
+    clock = FakeClock()
+    hour = [0]
+    c = PacketCollector(
+        fake_geo(64507, "OrgG"), 25, lambda: None, clock=clock, wall=lambda: hour[0] * 3600.0
+    )
+    c.handle_frame(request_frame("192.0.2.13"))
+    assert c._hourly[0].count() >= 1
+    hour[0] = 1
+    c.handle_frame(request_frame("192.0.2.14"))
+    assert c._hour == 1
+    assert c._hourly[1].count() >= 1

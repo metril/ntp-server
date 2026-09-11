@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""ntp-server-exporter: chronyc clients + pool.ntp.org score sidecar.
+"""ntp-server-exporter: passive NTP capture + pool.ntp.org score sidecar.
 
 Two collectors share one prometheus_client HTTP endpoint:
-  - clients: polls `chronyc -c clients` every CLIENTS_POLL_INTERVAL seconds,
-    geo/ASN-enriches with GeoLite2, exports country/ASN counters.
+  - capture: reads NTP packets off a raw AF_PACKET socket with a kernel-side
+    cBPF `udp port 123` filter, geo/ASN-enriches each client IP with
+    GeoLite2, and flushes country/ASN counters every CLIENTS_POLL_INTERVAL
+    seconds. chronyd is never queried.
   - ntppool: polls ntppool.org's score JSON every NTPPOOL_POLL_INTERVAL
     seconds, exports score/offset/rtt gauges.
 
-Parsing, delta computation, geo lookup and ntppool-JSON parsing are pure
-functions so they're testable without chronyc, real MMDB files, or network
-access; the collector classes wire them up to real subprocess/maxminddb/
-requests calls.
+Frame parsing, the cBPF program, the HyperLogLog sketch, geo lookup and
+ntppool-JSON parsing are pure functions/objects so they're testable without
+root, real MMDB files, or network access; the collector classes wire them up
+to real socket/maxminddb/requests calls.
 """
 
 import ctypes
@@ -20,7 +22,6 @@ import math
 import os
 import socket
 import struct
-import subprocess
 import threading
 import time
 from functools import lru_cache
@@ -43,78 +44,16 @@ log = logging.getLogger("ntp-server-exporter")
 NTPPOOL_IPV4 = os.environ.get("NTPPOOL_IPV4", "").strip()
 NTP_ASN_TOP_N = int(os.environ.get("NTP_ASN_TOP_N", "25"))
 GEOIP_DIR = os.environ.get("GEOIP_DIR", "/geoip")
-CHRONYC_BIN = os.environ.get("CHRONYC_BIN", "chronyc")
 LISTEN_ADDR = os.environ.get("LISTEN_ADDR", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "9124"))
-CLIENTS_POLL_INTERVAL = int(os.environ.get("CLIENTS_POLL_INTERVAL", "60"))
+CLIENTS_POLL_INTERVAL = int(os.environ.get("CLIENTS_POLL_INTERVAL", "15"))
 NTPPOOL_POLL_INTERVAL = int(os.environ.get("NTPPOOL_POLL_INTERVAL", "300"))
 
 NTPPOOL_USER_AGENT = "ntp-server-exporter/1.0 (+github.com/metril/ntp-server)"
 NTPPOOL_URL_TEMPLATE = "https://www.ntppool.org/scores/{ip}/json?limit=10&monitor=*"
 NTPPOOL_OVERALL_URL_TEMPLATE = "https://www.ntppool.org/scores/{ip}/json?limit=1"
 
-UNIQUE_DAILY_WINDOW_SECONDS = 24 * 3600
-
-# --- Pure functions: clients CSV parsing + delta -----------------------
-
-_CLIENTS_CSV_FIELDS = (
-    "ntp_pkts",
-    "ntp_drops",
-    "ntp_int",
-    "ntp_intl",
-    "ntp_last",
-    "cmd_pkts",
-    "cmd_drops",
-    "cmd_int",
-    "cmd_last",
-)
-
-
-def parse_clients_csv(raw):
-    """Parse `chronyc -c clients` CSV output into a list of row dicts.
-
-    Columns: addr,ntp_pkts,ntp_drops,ntp_int,ntp_intl,ntp_last,cmd_pkts,
-    cmd_drops,cmd_int,cmd_last. Non-numeric/header rows and malformed lines
-    are skipped.
-    """
-    rows = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split(",")
-        if len(parts) != 1 + len(_CLIENTS_CSV_FIELDS):
-            continue
-        addr = parts[0].strip()
-        if not addr:
-            continue
-        try:
-            nums = [int(x) for x in parts[1:]]
-        except ValueError:
-            continue
-        row = {"addr": addr}
-        row.update(zip(_CLIENTS_CSV_FIELDS, nums))
-        rows.append(row)
-    return rows
-
-
-def compute_deltas(prev, curr):
-    """Compute per-IP (delta_pkts, delta_drops) since the previous poll.
-
-    prev/curr: {ip: (ntp_pkts, ntp_drops)}. An IP missing from `prev` is
-    treated as starting from (0, 0) (its whole current value is the delta).
-    If a counter went backwards (table eviction/chronyd restart) the
-    current value is treated as the full delta rather than going negative.
-    IPs absent from `curr` are dropped (not included in the result).
-    """
-    deltas = {}
-    for ip, (pkts, drops) in curr.items():
-        p_pkts, p_drops = prev.get(ip, (0, 0))
-        d_pkts = pkts - p_pkts if pkts >= p_pkts else pkts
-        d_drops = drops - p_drops if drops >= p_drops else drops
-        deltas[ip] = (d_pkts, d_drops)
-    return deltas
-
+ACTIVE_WINDOW_SECONDS = 300
 
 # --- Pure functions: geo/ASN lookup -------------------------------------
 
@@ -438,12 +377,19 @@ ntp_client_requests_by_asn_total = Counter(
     "NTP client requests by ASN (top-N, rest folded to 'other')",
     ["asn", "as_org"],
 )
-ntp_clients_active = Gauge("ntp_clients_active", "Rows in chronyd's client table")
+ntp_clients_active = Gauge("ntp_clients_active", "Distinct client IPs seen in the last 300s")
 ntp_clients_unique_daily = Gauge(
     "ntp_clients_unique_daily", "Distinct client IPs seen in the last 24h"
 )
 ntp_clients_scrape_success = Gauge(
-    "ntp_clients_scrape_success", "1 if the last chronyc clients poll succeeded"
+    "ntp_clients_scrape_success", "1 while the NTP capture socket is open"
+)
+ntp_capture_packets_total = Counter(
+    "ntp_capture_packets_total", "NTP frames captured, by direction", ["direction"]
+)
+ntp_capture_parse_errors_total = Counter(
+    "ntp_capture_parse_errors_total",
+    "Frames that passed the BPF filter but could not be parsed",
 )
 
 ntppool_score = Gauge("ntppool_score", "Latest pool.ntp.org score", ["ip"])
@@ -537,76 +483,134 @@ class GeoIPResolver:
         return self._resolve_cached(ip)
 
 
-# --- Clients collector ----------------------------------------------------
+# --- Capture collector ----------------------------------------------------
 
 
-class ClientsCollector:
-    def __init__(self, chronyc_bin, geo_resolver, asn_top_n):
-        self._chronyc_bin = chronyc_bin
+def open_capture_socket():
+    """Open an unbound AF_PACKET/SOCK_RAW socket filtered to udp port 123."""
+    sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
+    try:
+        sock._ntp_bpf = attach_filter(sock, build_ntp_bpf())  # keep buffer alive
+        sock.settimeout(1.0)
+    except Exception:
+        sock.close()
+        raise
+    return sock
+
+
+class PacketCollector:
+    """Aggregates captured NTP frames in memory and flushes to prometheus.
+
+    The hot path (handle_frame) only touches plain dicts and the hourly HLL
+    sketches; the registry is written once per flush.
+    """
+
+    def __init__(self, geo_resolver, asn_top_n, sock_factory, clock=time.monotonic, wall=time.time):
         self._geo = geo_resolver
         self._asn_top_n = asn_top_n
-        self._prev = {}  # ip -> (ntp_pkts, ntp_drops)
+        self._sock_factory = sock_factory
+        self._clock = clock
+        self._wall = wall
+        self._requests = {}  # (country, continent) -> count since last flush
+        self._responses = {}  # (country, continent) -> count since last flush
+        self._asn_requests = {}  # (asn, as_org) -> count since last flush
         self._asn_totals = {}  # asn -> cumulative requests, for top-N ranking
-        self._seen_at = {}  # ip -> last-seen unix time, for unique_daily
-        self._initialized = False  # True once the first successful poll has seeded state
+        self._active = {}  # ip -> last-seen monotonic time
+        self._hourly = [HyperLogLog() for _ in range(24)]
+        self._hour = None
 
-    def poll_once(self):
-        try:
-            out = subprocess.run(
-                [self._chronyc_bin, "-c", "clients"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=True,
-            ).stdout
-        except Exception:
-            log.exception("chronyc -c clients failed")
-            ntp_clients_scrape_success.set(0)
+    def _current_bucket(self):
+        hour = time.gmtime(self._wall()).tm_hour
+        if self._hour is None:
+            self._hour = hour
+        elif hour != self._hour:
+            self._hourly[hour] = HyperLogLog()  # drop yesterday's same-hour data
+            self._hour = hour
+        return self._hourly[hour]
+
+    def handle_frame(self, frame):
+        parsed = parse_frame(frame)
+        if parsed is None:
+            ntp_capture_parse_errors_total.inc()
             return
+        direction, ip = parsed
+        ntp_capture_packets_total.labels(direction=direction).inc()
 
-        rows = parse_clients_csv(out)
-        curr = {r["addr"]: (r["ntp_pkts"], r["ntp_drops"]) for r in rows}
+        country, continent, asn, as_org = self._geo.resolve(ip)
+        key = (country, continent)
+        if direction == "request":
+            self._requests[key] = self._requests.get(key, 0) + 1
+            akey = (asn, as_org)
+            self._asn_requests[akey] = self._asn_requests.get(akey, 0) + 1
+            self._active[ip] = self._clock()
+            self._current_bucket().add(ip)
+        else:
+            self._responses[key] = self._responses.get(key, 0) + 1
 
-        now = time.time()
-        for ip in curr:
-            self._seen_at[ip] = now
-        cutoff = now - UNIQUE_DAILY_WINDOW_SECONDS
-        for ip in [ip for ip, t in self._seen_at.items() if t < cutoff]:
-            del self._seen_at[ip]
+    def flush(self):
+        requests, self._requests = self._requests, {}
+        responses, self._responses = self._responses, {}
+        asn_requests, self._asn_requests = self._asn_requests, {}
 
-        if not self._initialized:
-            # First successful poll: seed state from chronyd's current table
-            # instead of treating its cumulative history as one huge delta.
-            self._prev = curr
-            self._initialized = True
-            ntp_clients_active.set(len(rows))
-            ntp_clients_unique_daily.set(len(self._seen_at))
-            ntp_clients_scrape_success.set(1)
-            return
+        for (country, continent), n in requests.items():
+            ntp_client_requests_total.labels(country=country, continent=continent).inc(n)
+            drops = n - responses.get((country, continent), 0)
+            if drops > 0:
+                ntp_client_drops_total.labels(country=country, continent=continent).inc(drops)
 
-        deltas = compute_deltas(self._prev, curr)
-        self._prev = curr
-
-        for ip, (d_pkts, d_drops) in deltas.items():
-            country, continent, asn, as_org = self._geo.resolve(ip)
-            if d_pkts:
-                ntp_client_requests_total.labels(country=country, continent=continent).inc(d_pkts)
-            if d_drops:
-                ntp_client_drops_total.labels(country=country, continent=continent).inc(d_drops)
+        for (asn, _org), n in asn_requests.items():
             if asn is not None:
-                self._asn_totals[asn] = self._asn_totals.get(asn, 0) + d_pkts
-            if d_pkts:
-                fasn, forg = fold_asn(asn, as_org, self._asn_totals, self._asn_top_n)
-                ntp_client_requests_by_asn_total.labels(asn=str(fasn), as_org=forg).inc(d_pkts)
+                self._asn_totals[asn] = self._asn_totals.get(asn, 0) + n
+        for (asn, as_org), n in asn_requests.items():
+            fasn, forg = fold_asn(asn, as_org, self._asn_totals, self._asn_top_n)
+            ntp_client_requests_by_asn_total.labels(asn=str(fasn), as_org=forg).inc(n)
 
-        ntp_clients_active.set(len(rows))
-        ntp_clients_unique_daily.set(len(self._seen_at))
-        ntp_clients_scrape_success.set(1)
+        cutoff = self._clock() - ACTIVE_WINDOW_SECONDS
+        for ip in [ip for ip, seen in self._active.items() if seen < cutoff]:
+            del self._active[ip]
+        ntp_clients_active.set(len(self._active))
+
+        merged = HyperLogLog()
+        for sketch in self._hourly:
+            merged.merge(sketch)
+        ntp_clients_unique_daily.set(merged.count())
 
     def run_forever(self, interval):
+        sock = None
+        last_flush = self._clock()
         while True:
-            self.poll_once()
-            time.sleep(interval)
+            if sock is None:
+                try:
+                    sock = self._sock_factory()
+                except OSError:
+                    log.exception("failed to open NTP capture socket; retrying in 30s")
+                    ntp_clients_scrape_success.set(0)
+                    time.sleep(30)
+                    continue
+                log.info("NTP capture socket open")
+                ntp_clients_scrape_success.set(1)
+
+            try:
+                frame = sock.recv(65535)
+            except TimeoutError:
+                frame = None
+            except OSError:
+                log.exception("NTP capture socket read failed; reopening")
+                ntp_clients_scrape_success.set(0)
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                sock = None
+                frame = None
+
+            if frame:
+                self.handle_frame(frame)
+
+            now = self._clock()
+            if now - last_flush >= interval:
+                self.flush()
+                last_flush = now
 
 
 # --- ntppool collector -----------------------------------------------------
@@ -668,13 +672,13 @@ def main():
     log.info("listening on %s:%s", LISTEN_ADDR, LISTEN_PORT)
 
     geo = GeoIPResolver(GEOIP_DIR)
-    clients = ClientsCollector(CHRONYC_BIN, geo, NTP_ASN_TOP_N)
+    capture = PacketCollector(geo, NTP_ASN_TOP_N, open_capture_socket)
     ntppool = NtpPoolCollector(NTPPOOL_IPV4)
 
     if not NTPPOOL_IPV4:
         log.info("NTPPOOL_IPV4 not set; ntppool collector disabled")
 
-    t = threading.Thread(target=clients.run_forever, args=(CLIENTS_POLL_INTERVAL,), daemon=True)
+    t = threading.Thread(target=capture.run_forever, args=(CLIENTS_POLL_INTERVAL,), daemon=True)
     t.start()
 
     ntppool.run_forever(NTPPOOL_POLL_INTERVAL)
