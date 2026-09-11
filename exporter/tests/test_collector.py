@@ -321,3 +321,288 @@ def test_flush_rotates_hourly_buckets_even_during_a_silent_period():
         assert c._hourly[h].count() == 0
     assert c._hourly[3].count() >= 1
     assert exporter.ntp_clients_unique_daily._value.get() >= 1
+
+
+# --- recv_frame (SCM_TIMESTAMPNS) ----------------------------------------
+
+
+def test_recv_frame_parses_scm_timestampns():
+    import struct
+
+    class FakeSock:
+        def recvmsg(self, bufsize, ancsize):
+            ancdata = [(socket.SOL_SOCKET, exporter.SCM_TIMESTAMPNS, struct.pack("qq", 100, 250_000_000))]
+            return b"frame-bytes", ancdata, 0, None
+
+    frame, ts, _pkttype = exporter.recv_frame(FakeSock())
+    assert frame == b"frame-bytes"
+    assert ts == 100.25
+
+
+def test_recv_frame_returns_none_ts_when_no_cmsg():
+    class FakeSock:
+        def recvmsg(self, bufsize, ancsize):
+            return b"frame-bytes", [], 0, None
+
+    frame, ts, _pkttype = exporter.recv_frame(FakeSock())
+    assert frame == b"frame-bytes"
+    assert ts is None
+
+
+def test_recv_frame_falls_back_to_recv_when_no_recvmsg():
+    class FakeSock:
+        def recv(self, n):
+            return b"legacy-frame"
+
+    frame, ts, pkttype = exporter.recv_frame(FakeSock())
+    assert frame == b"legacy-frame"
+    assert ts is None
+
+
+def test_open_capture_socket_sets_so_timestampns(monkeypatch):
+    setsockopt_calls = []
+
+    class FakeSock:
+        def setsockopt(self, level, optname, value):
+            setsockopt_calls.append((level, optname))
+
+        def settimeout(self, t):
+            pass
+
+        def close(self):
+            pass
+
+    fake = FakeSock()
+    monkeypatch.setattr(exporter.socket, "socket", lambda *a, **k: fake)
+
+    exporter.open_capture_socket()
+
+    assert (socket.SOL_SOCKET, exporter.SO_TIMESTAMPNS) in setsockopt_calls
+
+
+def test_run_forever_passes_recvmsg_timestamp_to_handle_frame(monkeypatch):
+    import struct
+
+    clock = FakeClock()
+
+    class StopCapture(BaseException):
+        pass
+
+    calls = []
+    real_handle_frame = exporter.PacketCollector.handle_frame
+
+    def spy_handle_frame(self, frame, ts=None, pkttype=None):
+        calls.append(ts)
+        raise StopCapture()
+
+    monkeypatch.setattr(exporter.PacketCollector, "handle_frame", spy_handle_frame)
+
+    class FakeSock:
+        def recvmsg(self, bufsize, ancsize):
+            ancdata = [(socket.SOL_SOCKET, exporter.SCM_TIMESTAMPNS, struct.pack("qq", 42, 500_000_000))]
+            return request_frame(), ancdata, 0, None
+
+        def close(self):
+            pass
+
+    c = PacketCollector(fake_geo(), 25, lambda: FakeSock(), clock=clock, wall=lambda: 0.0)
+
+    with pytest.raises(StopCapture):
+        c.run_forever(15)
+
+    assert calls == [42.5]
+
+
+# --- response latency histogram / pending dict ----------------------------
+
+
+def _histogram_sum(metric):
+    return metric.labels()._sum.get() if metric._labelnames else metric._sum.get()
+
+
+def request_frame_with_xid(ip, xid):
+    payload = b"\x23" + b"\x00" * 39 + xid
+    return eth(ipv4(ip, "198.51.100.1", udp(41234, 123, payload)))
+
+
+def response_frame_with_xid(ip, xid):
+    payload = b"\x23" + b"\x00" * 23 + xid + b"\x00" * 16
+    return eth(ipv4("198.51.100.1", ip, udp(123, 41234, payload)))
+
+
+def test_response_latency_observed_for_a_matched_request_response_pair():
+    clock = FakeClock()
+    c = make(clock)
+    xid = b"\xaa" * 8
+    before = exporter.ntp_response_latency_seconds._sum.get()
+
+    c.handle_frame(request_frame_with_xid("192.0.2.50", xid), ts=100.0)
+    c.handle_frame(response_frame_with_xid("192.0.2.50", xid), ts=100.001)
+
+    after = exporter.ntp_response_latency_seconds._sum.get()
+    assert after - before == pytest.approx(0.001)
+    assert ("192.0.2.50", xid) not in c._pending
+
+
+def test_response_with_unknown_xid_is_ignored():
+    clock = FakeClock()
+    c = make(clock)
+    before = exporter.ntp_response_latency_seconds._sum.get()
+    c.handle_frame(response_frame_with_xid("192.0.2.51", b"\xbb" * 8), ts=100.0)
+    assert exporter.ntp_response_latency_seconds._sum.get() == before
+
+
+def test_unmatched_request_is_swept_at_flush_and_dict_stays_bounded():
+    clock = FakeClock()
+    c = make(clock)
+    xid = b"\xcc" * 8
+    c.handle_frame(request_frame_with_xid("192.0.2.52", xid), ts=100.0)
+    assert ("192.0.2.52", xid) in c._pending
+
+    c._wall = lambda: 100.0 + exporter.PENDING_TTL_SECONDS + 0.1
+    c.flush()
+    assert ("192.0.2.52", xid) not in c._pending
+
+
+def test_pending_overflow_counter_increments_past_cap(monkeypatch):
+    clock = FakeClock()
+    c = make(clock)
+    monkeypatch.setattr(exporter, "PENDING_MAX", 2)
+    before = exporter.ntp_capture_pending_overflow_total._value.get()
+
+    c.handle_frame(request_frame_with_xid("192.0.2.53", b"\x01" * 8), ts=100.0)
+    c.handle_frame(request_frame_with_xid("192.0.2.54", b"\x02" * 8), ts=100.0)
+    c.handle_frame(request_frame_with_xid("192.0.2.55", b"\x03" * 8), ts=100.0)
+
+    assert exporter.ntp_capture_pending_overflow_total._value.get() == before + 1
+    assert len(c._pending) == 2
+
+
+# --- version/family counters + request-interval histogram -----------------
+
+
+def test_flush_publishes_version_and_family_counters():
+    clock = FakeClock()
+    c = make(clock)
+    before_v4 = counter(exporter.ntp_client_requests_by_version_total, version="4")
+    before_ipv4 = counter(exporter.ntp_client_requests_by_family_total, family="ipv4")
+
+    c.handle_frame(request_frame_with_xid("192.0.2.60", b"\x01" * 8))
+    c.flush()
+
+    assert counter(exporter.ntp_client_requests_by_version_total, version="4") == before_v4 + 1
+    assert counter(exporter.ntp_client_requests_by_family_total, family="ipv4") == before_ipv4 + 1
+
+
+def test_unknown_version_folds_to_other():
+    clock = FakeClock()
+    c = make(clock)
+    before = counter(exporter.ntp_client_requests_by_version_total, version="other")
+    frame = eth(ipv4("192.0.2.61", "198.51.100.1", udp(41234, 123, b"\x00" * 10)))
+    c.handle_frame(frame)
+    c.flush()
+    assert counter(exporter.ntp_client_requests_by_version_total, version="other") == before + 1
+
+
+def test_request_interval_observed_only_from_the_second_request():
+    clock = FakeClock()
+    c = make(clock)
+    before = exporter.ntp_client_request_interval_seconds._sum.get()
+
+    c.handle_frame(request_frame("192.0.2.62"))
+    assert exporter.ntp_client_request_interval_seconds._sum.get() == before
+
+    clock.advance(5)
+    c.handle_frame(request_frame("192.0.2.62"))
+    after = exporter.ntp_client_request_interval_seconds._sum.get()
+    assert after - before == pytest.approx(5)
+
+
+# --- pkttype filtering (ignore chronyd's own upstream polls) --------------
+
+
+def test_outgoing_frame_with_dport_123_is_not_a_request():
+    clock = FakeClock()
+    c = make(clock)
+    before_req = counter(exporter.ntp_capture_packets_total, direction="request")
+    before_active = len(c._active)
+
+    c.handle_frame(request_frame("192.0.2.70"), pkttype=exporter.PACKET_OUTGOING)
+
+    assert counter(exporter.ntp_capture_packets_total, direction="request") == before_req
+    assert len(c._active) == before_active
+
+
+def test_incoming_frame_with_sport_123_is_not_a_response():
+    clock = FakeClock()
+    c = make(clock)
+    before_resp = counter(exporter.ntp_capture_packets_total, direction="response")
+
+    c.handle_frame(response_frame("192.0.2.71"), pkttype=exporter.PACKET_HOST)
+
+    assert counter(exporter.ntp_capture_packets_total, direction="response") == before_resp
+
+
+def test_none_pkttype_keeps_old_behaviour():
+    clock = FakeClock()
+    c = make(clock)
+    before_req = counter(exporter.ntp_capture_packets_total, direction="request")
+    c.handle_frame(request_frame("192.0.2.72"), pkttype=None)
+    assert counter(exporter.ntp_capture_packets_total, direction="request") == before_req + 1
+
+
+def test_pkttype_filtered_frame_does_not_count_as_parse_error():
+    clock = FakeClock()
+    c = make(clock)
+    before = exporter.ntp_capture_parse_errors_total._value.get()
+    c.handle_frame(request_frame("192.0.2.73"), pkttype=exporter.PACKET_OUTGOING)
+    assert exporter.ntp_capture_parse_errors_total._value.get() == before
+
+
+def test_recv_frame_returns_pkttype_from_recvmsg_address():
+    class FakeSock:
+        def recvmsg(self, bufsize, ancsize):
+            return b"frame-bytes", [], 0, ("eth0", 3, exporter.PACKET_OUTGOING, 1, b"\x00" * 6)
+
+    frame, ts, pkttype = exporter.recv_frame(FakeSock())
+    assert pkttype == exporter.PACKET_OUTGOING
+
+
+def test_recv_frame_pkttype_is_none_on_recv_fallback():
+    class FakeSock:
+        def recv(self, n):
+            return b"legacy-frame"
+
+    frame, ts, pkttype = exporter.recv_frame(FakeSock())
+    assert pkttype is None
+
+
+# --- incremental pending sweep (bounded without waiting for flush) --------
+
+
+def test_pending_is_swept_incrementally_without_flush():
+    clock = FakeClock()
+    c = make(clock)
+    for i in range(1023):
+        xid = i.to_bytes(8, "big")
+        c.handle_frame(request_frame_with_xid("192.0.2.100", xid), ts=100.0)
+    assert len(c._pending) == 1023
+
+    c.handle_frame(
+        request_frame_with_xid("192.0.2.100", b"\xff" * 8),
+        ts=100.0 + exporter.PENDING_TTL_SECONDS + 5,
+    )
+
+    assert len(c._pending) == 1
+
+
+# --- HELP text -------------------------------------------------------------
+
+
+def test_request_interval_help_text_explains_the_active_window():
+    assert (
+        exporter.ntp_client_request_interval_seconds._documentation
+        == "Seconds between consecutive requests from the same client IP; intervals "
+        "longer than roughly 300s are not observed because the client has left the "
+        "active window"
+    )

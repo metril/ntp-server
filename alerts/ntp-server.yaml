@@ -1,0 +1,226 @@
+# Grafana file-provisioned alert rule.
+# datasourceUid is the homelab VictoriaMetrics datasource (Settings > Data sources).
+# Change it if this Grafana points at a different victoriametrics-metrics-datasource.
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: ntp-server-health
+    folder: NTP Server
+    interval: 1m
+    rules:
+      - uid: chrony-down
+        title: chrony exporter down
+        condition: C
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "chrony exporter is down on {{ $labels.host }}"
+          description: "chrony_up has been below 1 for at least 5 minutes."
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: afwsbh7gha9kwf
+            model:
+              expr: chrony_up
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params:
+                      - 1
+              refId: C
+        noDataState: Alerting
+        execErrState: Error
+
+      - uid: chrony-offset-high
+        title: System time offset high
+        condition: C
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "System time offset high on {{ $labels.host }}"
+          description: "abs(chrony_tracking_system_time_seconds) has been above 0.01 for at least 10 minutes."
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: afwsbh7gha9kwf
+            model:
+              expr: abs(chrony_tracking_system_time_seconds)
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 0.01
+              refId: C
+        noDataState: NoData
+        execErrState: Error
+
+      - uid: chrony-no-reachable-source
+        title: No fully reachable time source
+        condition: C
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No fully reachable time source on {{ $labels.host }}"
+          description: "count(chrony_sources_reachability_ratio == 1) or vector(0) has been below 1 for at least 10 minutes."
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: afwsbh7gha9kwf
+            model:
+              expr: count(chrony_sources_reachability_ratio == 1) or vector(0)
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params:
+                      - 1
+              refId: C
+        noDataState: Alerting
+        execErrState: Error
+
+      - uid: ntp-geoip-missing
+        title: GeoIP database not loaded
+        condition: C
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "GeoIP database not loaded on {{ $labels.host }}"
+          description: "ntp_geoip_database_loaded has been below 1 for at least 1h for db {{ $labels.db }}."
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: afwsbh7gha9kwf
+            model:
+              expr: ntp_geoip_database_loaded
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params:
+                      - 1
+              refId: C
+        noDataState: NoData
+        execErrState: Error
+
+      - uid: ntp-capture-kernel-drops
+        title: Passive capture dropping packets in kernel
+        condition: C
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Passive capture dropping packets in kernel on {{ $labels.host }}"
+          description: "rate(ntp_capture_kernel_drops_total[5m]) has been above 0 for at least 15 minutes."
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: afwsbh7gha9kwf
+            model:
+              expr: rate(ntp_capture_kernel_drops_total[5m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 0
+              refId: C
+        noDataState: NoData
+        execErrState: Error
+
+      - uid: ntp-clients-exporter-down
+        title: Passive capture exporter down
+        condition: C
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Passive capture exporter down on {{ $labels.host }}"
+          description: "ntp_clients_scrape_success has been below 1 for at least 5 minutes."
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: afwsbh7gha9kwf
+            model:
+              expr: ntp_clients_scrape_success
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params:
+                      - 1
+              refId: C
+        noDataState: Alerting
+        execErrState: Error

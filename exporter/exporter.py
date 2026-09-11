@@ -4,8 +4,12 @@
 Two collectors share one prometheus_client HTTP endpoint:
   - capture: reads NTP packets off a raw AF_PACKET socket with a kernel-side
     cBPF `udp port 123` filter, geo/ASN-enriches each client IP with
-    GeoLite2, and flushes country/ASN counters every CLIENTS_POLL_INTERVAL
-    seconds. chronyd is never queried.
+    GeoLite2, and flushes country/ASN/version/family counters every
+    CLIENTS_POLL_INTERVAL seconds. chronyd is never queried. Kernel receive
+    timestamps (SO_TIMESTAMPNS) pair each request with its response by NTP
+    transmit/origin timestamp to measure passive request-to-response
+    latency, and per-client request spacing feeds an active-client interval
+    histogram.
   - ntppool: polls ntppool.org's score JSON every NTPPOOL_POLL_INTERVAL
     seconds, exports score/offset/rtt gauges.
 
@@ -25,6 +29,7 @@ import struct
 import threading
 import time
 from functools import lru_cache
+from typing import NamedTuple
 
 import requests
 from prometheus_client import (
@@ -34,6 +39,7 @@ from prometheus_client import (
     REGISTRY,
     Counter,
     Gauge,
+    Histogram,
     start_http_server,
 )
 
@@ -59,6 +65,9 @@ NTPPOOL_URL_TEMPLATE = "https://www.ntppool.org/scores/{ip}/json?limit=10&monito
 NTPPOOL_OVERALL_URL_TEMPLATE = "https://www.ntppool.org/scores/{ip}/json?limit=1"
 
 ACTIVE_WINDOW_SECONDS = 300
+PENDING_MAX = 50000
+PENDING_TTL_SECONDS = 2
+PENDING_SWEEP_EVERY = 1024
 
 # --- Pure functions: geo/ASN lookup -------------------------------------
 
@@ -183,14 +192,40 @@ IPPROTO_UDP = 17
 NTP_PORT = 123
 
 
-def parse_frame(frame):
-    """Classify one captured Ethernet frame as NTP request or response.
+NTP_PAYLOAD_MIN = 48
 
-    Returns ("request", src_ip) when the UDP destination port is 123,
-    ("response", dst_ip) when the UDP source port is 123, else None.
+
+class ParsedFrame(NamedTuple):
+    direction: str
+    ip: str
+    family: str
+    version: "str | None"
+    xid: "bytes | None"
+
+
+def _ntp_version(payload):
+    v = (payload[0] >> 3) & 7
+    if 1 <= v <= 4:
+        return str(v)
+    return "other"
+
+
+def parse_ntp_frame(frame):
+    """Classify one captured Ethernet frame as an NTP request or response
+    and extract its NTP-layer fields.
+
+    Returns a ParsedFrame(direction, ip, family, version, xid), or None if
+    the frame isn't a parseable NTP-over-UDP packet. `ip` is the client IP
+    (src for a request, dst for a response); `family` is "ipv4"/"ipv6".
+    When the UDP payload is shorter than a full 48-byte NTP header, version
+    and xid are None. `version` is the NTP version field as text, clamped to
+    "other" outside 1..4. `xid` pairs a request with its response: for a
+    request it's the transmit timestamp (bytes 40:48), which the server
+    echoes back as the response's origin timestamp (bytes 24:32).
+
     Handles an optional 802.1Q tag, IPv4 with a variable IHL, and IPv6 with
     next-header UDP only (extension headers are not walked). Pure: takes
-    bytes, returns a tuple of text, touches no global state.
+    bytes, returns a namedtuple, touches no global state.
     """
     n = len(frame)
     if n < ETH_HDR_LEN:
@@ -214,6 +249,7 @@ def parse_frame(frame):
         src = socket.inet_ntop(socket.AF_INET, frame[off + 12 : off + 16])
         dst = socket.inet_ntop(socket.AF_INET, frame[off + 16 : off + 20])
         off += ihl
+        family = "ipv4"
     elif ethertype == ETHERTYPE_IPV6:
         if n < off + 40:
             return None
@@ -222,6 +258,7 @@ def parse_frame(frame):
         src = socket.inet_ntop(socket.AF_INET6, frame[off + 8 : off + 24])
         dst = socket.inet_ntop(socket.AF_INET6, frame[off + 24 : off + 40])
         off += 40
+        family = "ipv6"
     else:
         return None
 
@@ -229,11 +266,36 @@ def parse_frame(frame):
         return None
     sport = int.from_bytes(frame[off : off + 2], "big")
     dport = int.from_bytes(frame[off + 2 : off + 4], "big")
+    off += 8
+    payload = frame[off:]
+
     if dport == NTP_PORT:
-        return "request", src
-    if sport == NTP_PORT:
-        return "response", dst
-    return None
+        direction, ip = "request", src
+    elif sport == NTP_PORT:
+        direction, ip = "response", dst
+    else:
+        return None
+
+    version = None
+    xid = None
+    if len(payload) >= NTP_PAYLOAD_MIN:
+        version = _ntp_version(payload)
+        xid = payload[40:48] if direction == "request" else payload[24:32]
+
+    return ParsedFrame(direction, ip, family, version, xid)
+
+
+def parse_frame(frame):
+    """Classify one captured Ethernet frame as NTP request or response.
+
+    Returns ("request", src_ip) when the UDP destination port is 123,
+    ("response", dst_ip) when the UDP source port is 123, else None.
+    Thin wrapper over parse_ntp_frame() for callers that only need
+    direction/IP. Pure: takes bytes, returns a tuple of text, touches no
+    global state.
+    """
+    parsed = parse_ntp_frame(frame)
+    return None if parsed is None else (parsed.direction, parsed.ip)
 
 
 # --- cBPF filter: "udp port 123" over IPv4 and IPv6 -----------------------
@@ -406,6 +468,27 @@ ntp_capture_kernel_drops_total = Counter(
     "ntp_capture_kernel_drops_total",
     "Packets the kernel dropped before the capture socket could read them (PACKET_STATISTICS)",
 )
+ntp_capture_pending_overflow_total = Counter(
+    "ntp_capture_pending_overflow_total",
+    "Requests dropped from the request/response pairing table because it was full (PENDING_MAX)",
+)
+ntp_client_requests_by_version_total = Counter(
+    "ntp_client_requests_by_version_total", "NTP client requests by NTP version", ["version"]
+)
+ntp_client_requests_by_family_total = Counter(
+    "ntp_client_requests_by_family_total", "NTP client requests by IP family", ["family"]
+)
+ntp_client_request_interval_seconds = Histogram(
+    "ntp_client_request_interval_seconds",
+    "Seconds between consecutive requests from the same client IP; intervals longer than "
+    "roughly 300s are not observed because the client has left the active window",
+    buckets=(0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, float("inf")),
+)
+ntp_response_latency_seconds = Histogram(
+    "ntp_response_latency_seconds",
+    "Server request-to-response latency measured passively",
+    buckets=(20e-6, 50e-6, 100e-6, 200e-6, 500e-6, 1e-3, 2e-3, 5e-3, 10e-3, 25e-3, 50e-3, float("inf")),
+)
 
 ntppool_score = Gauge("ntppool_score", "Latest pool.ntp.org score", ["ip"])
 ntppool_monitor_score = Gauge(
@@ -526,17 +609,50 @@ class GeoIPResolver:
 # --- Capture collector ----------------------------------------------------
 
 
+SO_TIMESTAMPNS = 35
+SCM_TIMESTAMPNS = 35
+PACKET_HOST = 0
+PACKET_OUTGOING = 4
+
+
 def open_capture_socket():
     """Open an unbound AF_PACKET/SOCK_RAW socket filtered to udp port 123."""
     sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, CAPTURE_RCVBUF_BYTES)
+        sock.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMPNS, 1)
         attach_filter(sock, build_ntp_bpf())  # buffer only needs to outlive setsockopt
         sock.settimeout(1.0)
     except Exception:
         sock.close()
         raise
     return sock
+
+
+def recv_frame(sock):
+    """Read one frame plus its kernel receive timestamp (CLOCK_REALTIME) and
+    AF_PACKET pkttype (PACKET_HOST / PACKET_OUTGOING / ...).
+
+    Uses recvmsg()+SCM_TIMESTAMPNS when the socket supports it (requires
+    SO_TIMESTAMPNS to have been set, as open_capture_socket() does). Returns
+    (frame, ts, pkttype); ts is a float unix timestamp or None if no
+    timestamp cmsg was attached; pkttype is None when the socket lacks
+    recvmsg (test fakes using plain recv) since there's no sockaddr_ll to
+    read it from -- callers should fall back to their own wall clock / skip
+    pkttype-based filtering in that case.
+    """
+    recvmsg = getattr(sock, "recvmsg", None)
+    if recvmsg is None:
+        return sock.recv(65535), None, None
+    frame, ancdata, _flags, addr = recvmsg(65535, socket.CMSG_SPACE(16))
+    ts = None
+    for level, cmsg_type, data in ancdata:
+        if level == socket.SOL_SOCKET and cmsg_type == SCM_TIMESTAMPNS and len(data) >= 16:
+            sec, nsec = struct.unpack("qq", data[:16])
+            ts = sec + nsec / 1e9
+            break
+    pkttype = addr[2] if addr is not None and len(addr) > 2 else None
+    return frame, ts, pkttype
 
 
 class PacketCollector:
@@ -556,7 +672,11 @@ class PacketCollector:
         self._responses = {}  # (country, continent) -> count since last flush
         self._asn_requests = {}  # (asn, as_org) -> count since last flush
         self._asn_totals = {}  # asn -> cumulative requests, for top-N ranking
+        self._version_requests = {}  # version -> count since last flush
+        self._family_requests = {}  # family -> count since last flush
         self._active = {}  # ip -> last-seen monotonic time
+        self._pending = {}  # (ip, xid) -> wall-clock request time, for latency pairing
+        self._frames_since_sweep = 0  # triggers an incremental _pending TTL sweep every PENDING_SWEEP_EVERY
         self._hourly = [HyperLogLog() for _ in range(24)]
         self._hour = None
         self._sock = None
@@ -578,12 +698,35 @@ class PacketCollector:
             self._hour = hour
         return self._hourly[hour]
 
-    def handle_frame(self, frame):
-        parsed = parse_frame(frame)
+    def handle_frame(self, frame, ts=None, pkttype=None):
+        parsed = parse_ntp_frame(frame)
         if parsed is None:
             ntp_capture_parse_errors_total.inc()
             return
-        direction, ip = parsed
+        direction, ip, family, version, xid = parsed
+
+        if pkttype is not None:
+            # The capture socket is unbound, so it also sees chronyd's own
+            # outgoing polls to upstream servers and their replies. A real
+            # client request arrives (not PACKET_OUTGOING); our own reply to
+            # a client is what we transmit (PACKET_OUTGOING). Anything else
+            # matching dport/sport 123 is our own upstream traffic, not
+            # client traffic, and must not be counted.
+            if direction == "request" and pkttype == PACKET_OUTGOING:
+                return
+            if direction == "response" and pkttype != PACKET_OUTGOING:
+                return
+
+        if ts is None:
+            ts = self._wall()
+
+        self._frames_since_sweep += 1
+        if self._frames_since_sweep >= PENDING_SWEEP_EVERY:
+            self._frames_since_sweep = 0
+            pending_cutoff = ts - PENDING_TTL_SECONDS
+            for pending_key in [k for k, t in self._pending.items() if t < pending_cutoff]:
+                del self._pending[pending_key]
+
         ntp_capture_packets_total.labels(direction=direction).inc()
 
         country, continent, asn, as_org = self._geo.resolve(ip)
@@ -592,10 +735,30 @@ class PacketCollector:
             self._requests[key] = self._requests.get(key, 0) + 1
             akey = (asn, as_org)
             self._asn_requests[akey] = self._asn_requests.get(akey, 0) + 1
-            self._active[ip] = self._clock()
+            v = version if version is not None else "other"
+            self._version_requests[v] = self._version_requests.get(v, 0) + 1
+            self._family_requests[family] = self._family_requests.get(family, 0) + 1
+
+            now_clock = self._clock()
+            prev = self._active.get(ip)
+            if prev is not None:
+                ntp_client_request_interval_seconds.observe(now_clock - prev)
+            self._active[ip] = now_clock
             self._current_bucket().add(ip)
+            if xid is not None:
+                pending_key = (ip, xid)
+                if pending_key not in self._pending and len(self._pending) >= PENDING_MAX:
+                    ntp_capture_pending_overflow_total.inc()
+                else:
+                    self._pending[pending_key] = ts
         else:
             self._responses[key] = self._responses.get(key, 0) + 1
+            if xid is not None:
+                req_ts = self._pending.pop((ip, xid), None)
+                if req_ts is not None:
+                    delta = ts - req_ts
+                    if delta >= 0:
+                        ntp_response_latency_seconds.observe(delta)
 
     def _read_kernel_drops(self):
         """Read and reset the kernel's AF_PACKET drop counter for self._sock.
@@ -640,10 +803,21 @@ class PacketCollector:
             fasn, forg = fold_asn(asn, as_org, self._asn_totals, self._asn_top_n)
             ntp_client_requests_by_asn_total.labels(asn=str(fasn), as_org=forg).inc(n)
 
+        version_requests, self._version_requests = self._version_requests, {}
+        family_requests, self._family_requests = self._family_requests, {}
+        for v, n in version_requests.items():
+            ntp_client_requests_by_version_total.labels(version=v).inc(n)
+        for f, n in family_requests.items():
+            ntp_client_requests_by_family_total.labels(family=f).inc(n)
+
         cutoff = self._clock() - ACTIVE_WINDOW_SECONDS
         for ip in [ip for ip, seen in self._active.items() if seen < cutoff]:
             del self._active[ip]
         ntp_clients_active.set(len(self._active))
+
+        pending_cutoff = self._wall() - PENDING_TTL_SECONDS
+        for pending_key in [k for k, t in self._pending.items() if t < pending_cutoff]:
+            del self._pending[pending_key]
 
         merged = HyperLogLog()
         for sketch in self._hourly:
@@ -668,9 +842,9 @@ class PacketCollector:
 
             try:
                 try:
-                    frame = sock.recv(65535)
+                    frame, ts, pkttype = recv_frame(sock)
                 except TimeoutError:
-                    frame = None
+                    frame, ts, pkttype = None, None, None
                 except OSError:
                     log.exception("NTP capture socket read failed; reopening")
                     ntp_clients_scrape_success.set(0)
@@ -680,10 +854,10 @@ class PacketCollector:
                         pass
                     sock = None
                     self._sock = None
-                    frame = None
+                    frame, ts, pkttype = None, None, None
 
                 if frame:
-                    self.handle_frame(frame)
+                    self.handle_frame(frame, ts, pkttype)
 
                 now = self._clock()
                 if now - last_flush >= interval:

@@ -101,3 +101,75 @@ def test_build_ntp_bpf_last_two_instructions_are_accept_then_reject():
     reject = struct.unpack("HBBI", prog[-8:])
     assert accept == (0x06, 0, 0, 0xFFFF)  # ret #65535
     assert reject == (0x06, 0, 0, 0)  # ret #0
+
+
+# --- parse_ntp_frame -------------------------------------------------------
+
+from exporter import parse_ntp_frame
+
+
+def ntp_payload(version=4, xmt=b"\x11" * 8, org=b"\x22" * 8):
+    li_vn_mode = (0 << 6) | ((version & 7) << 3) | 3  # client mode
+    body = bytes([li_vn_mode]) + b"\x00" * 39  # up to offset 40
+    body = body[:1] + b"\x00" * 23 + org + b"\x00" * 8 + xmt
+    assert len(body) == 48
+    return body
+
+
+def test_parse_ntp_frame_v4_request_reports_version_and_family():
+    payload = ntp_payload(version=4)
+    frame = eth(ipv4("203.0.113.5", "198.51.100.1", udp(41234, 123, payload)))
+    parsed = parse_ntp_frame(frame)
+    assert parsed.direction == "request"
+    assert parsed.ip == "203.0.113.5"
+    assert parsed.family == "ipv4"
+    assert parsed.version == "4"
+    assert parsed.xid == payload[40:48]
+
+
+def test_parse_ntp_frame_v3_request_reports_version():
+    payload = ntp_payload(version=3)
+    frame = eth(ipv4("203.0.113.5", "198.51.100.1", udp(41234, 123, payload)))
+    parsed = parse_ntp_frame(frame)
+    assert parsed.version == "3"
+
+
+def test_parse_ntp_frame_out_of_range_version_is_other():
+    payload = ntp_payload(version=7)
+    frame = eth(ipv4("203.0.113.5", "198.51.100.1", udp(41234, 123, payload)))
+    parsed = parse_ntp_frame(frame)
+    assert parsed.version == "other"
+
+
+def test_parse_ntp_frame_ipv6_family():
+    payload = ntp_payload(version=4)
+    frame = eth(
+        ipv6("2001:db8::1", "2001:db8::2", udp(41234, 123, payload)), ethertype=0x86DD
+    )
+    parsed = parse_ntp_frame(frame)
+    assert parsed.family == "ipv6"
+
+
+def test_parse_ntp_frame_request_and_response_xid_match_for_echoed_pair():
+    xmt = b"\xab" * 8
+    req_payload = ntp_payload(version=4, xmt=xmt)
+    req_frame = eth(ipv4("203.0.113.5", "198.51.100.1", udp(41234, 123, req_payload)))
+    req = parse_ntp_frame(req_frame)
+
+    resp_payload = ntp_payload(version=4, org=xmt)
+    resp_frame = eth(ipv4("198.51.100.1", "203.0.113.5", udp(123, 41234, resp_payload)))
+    resp = parse_ntp_frame(resp_frame)
+
+    assert req.xid == resp.xid == xmt
+
+
+def test_parse_ntp_frame_short_payload_has_no_version_or_xid():
+    frame = eth(ipv4("203.0.113.5", "198.51.100.1", udp(41234, 123, b"\x23" * 10)))
+    parsed = parse_ntp_frame(frame)
+    assert parsed.direction == "request"
+    assert parsed.version is None
+    assert parsed.xid is None
+
+
+def test_parse_ntp_frame_malformed_frame_returns_none():
+    assert parse_ntp_frame(b"\x00" * 6) is None

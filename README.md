@@ -228,6 +228,15 @@ skew and any kernel capture loss (see `ntp_capture_kernel_drops_total`);
 `ntp_capture_loop_errors_total`, and `ntp_capture_kernel_drops_total` are self-monitoring.
 `ntp_geoip_database_loaded{db="country"|"asn"}` is 1 while the corresponding GeoLite2 mmdb
 is open and readable, 0 if it's missing or failed to open.
+`ntp_client_requests_by_version_total{version}` and `ntp_client_requests_by_family_total{family}`
+break requests down by NTP version and IP family. `ntp_response_latency_seconds` is the
+server's request-to-response latency measured passively at the capture point (kernel
+receive timestamps on the request and its reply), not the client's round-trip time;
+pairing is best-effort by echoed transmit timestamp, so an unanswered request is simply
+never observed. `ntp_client_request_interval_seconds` is the time between consecutive
+requests from the same client IP, capped by the 300s active-client window.
+`ntp_capture_pending_overflow_total` counts requests dropped from the request/response
+pairing table because it was full.
 Separately the sidecar polls `ntppool.org`'s public score JSON (`ntppool_score`,
 `ntppool_monitor_score`, `ntppool_monitor_offset_seconds`, `ntppool_monitor_rtt_seconds`).
 Both feed the dashboard's Clients and pool.ntp.org rows. NTS-KE (TCP 4460) is not captured.
@@ -257,6 +266,7 @@ Setup:
    equivalent knob.
 4. Import `alerts/ntppool-score.yaml` into Grafana (provisioned alert rule, fires when
    `ntppool_score < 10` for 15m) alongside the dashboard.
+5. Import `alerts/ntp-server.yaml` into Grafana for chrony, GeoIP, and passive-capture health alerts.
 
 ## NTS notes
 

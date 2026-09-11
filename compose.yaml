@@ -66,10 +66,15 @@ services:
       # pages the whole client table over cmdmon (millions of records under
       # pool load), never finishes inside --chrony.timeout, and flips
       # chrony_up to 0. ntp-clients-exporter covers client stats passively.
+      # sourcestats is N+1 cmdmon requests per scrape (one per configured
+      # source), same cost shape as --collector.sources and independent of
+      # client load; clients was dropped because it pages the whole client
+      # table.
       - --chrony.address=unix:///run/chrony/chronyd.sock
       - --web.listen-address=127.0.0.1:9123
       - --collector.sources
       - --collector.serverstats
+      - --collector.sourcestats
       - --no-collector.dns-lookups
 
     depends_on:
