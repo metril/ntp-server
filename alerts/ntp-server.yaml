@@ -6,7 +6,7 @@ apiVersion: 1
 groups:
   - orgId: 1
     name: ntp-server-health
-    folder: NTP Server
+    folder: Homelab Alerts
     interval: 1m
     rules:
       - uid: chrony-down
