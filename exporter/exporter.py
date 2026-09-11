@@ -14,7 +14,9 @@ requests calls.
 """
 
 import ctypes
+import hashlib
 import logging
+import math
 import os
 import socket
 import struct
@@ -363,6 +365,58 @@ def attach_filter(sock, program):
         ctypes.string_at(ctypes.addressof(fprog), ctypes.sizeof(fprog)),
     )
     return buf
+
+
+# --- HyperLogLog ----------------------------------------------------------
+
+
+class HyperLogLog:
+    """Fixed-precision HyperLogLog over SHA-1-hashed string keys.
+
+    p=14 gives m=16384 one-byte registers (16 KiB) and ~0.81 % standard
+    error. Only the small-range linear-counting correction is applied; with
+    a 64-bit hash the large-range correction is unnecessary.
+    """
+
+    __slots__ = ("p", "m", "_alpha", "_bits", "registers")
+
+    def __init__(self, p=14):
+        if not 4 <= p <= 16:
+            raise ValueError("p must be between 4 and 16")
+        self.p = p
+        self.m = 1 << p
+        self._bits = 64 - p
+        self._alpha = 0.7213 / (1.0 + 1.079 / self.m)
+        self.registers = bytearray(self.m)
+
+    def add(self, key):
+        h = int.from_bytes(hashlib.sha1(key.encode("utf-8")).digest()[:8], "big")
+        idx = h >> self._bits
+        w = h & ((1 << self._bits) - 1)
+        rho = self._bits + 1 if w == 0 else self._bits - w.bit_length() + 1
+        if rho > self.registers[idx]:
+            self.registers[idx] = rho
+
+    def merge(self, other):
+        if other.p != self.p:
+            raise ValueError("cannot merge HyperLogLog sketches of different precision")
+        mine = self.registers
+        theirs = other.registers
+        for i in range(self.m):
+            if theirs[i] > mine[i]:
+                mine[i] = theirs[i]
+
+    def count(self):
+        raw = 0.0
+        zeros = 0
+        for r in self.registers:
+            raw += 1.0 / (1 << r)
+            if r == 0:
+                zeros += 1
+        estimate = self._alpha * self.m * self.m / raw
+        if estimate <= 2.5 * self.m and zeros:
+            return self.m * math.log(self.m / zeros)
+        return estimate
 
 
 # --- Metrics -------------------------------------------------------------
