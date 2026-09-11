@@ -6,3 +6,4 @@ HANDOFF.md
 notes/
 *.mcp.json__pycache__/
 *.pyc
+.mcp.json
