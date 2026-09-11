@@ -86,6 +86,7 @@ services:
     environment:
       NTPPOOL_IPV4: ${NTPPOOL_IPV4:-}
       NTP_ASN_TOP_N: ${NTP_ASN_TOP_N:-25}
+      CLIENTS_POLL_INTERVAL: ${CLIENTS_POLL_INTERVAL:-15}
 
     volumes:
       - geoip:/geoip:ro

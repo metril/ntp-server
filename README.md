@@ -109,6 +109,7 @@ Copy `.env.example` to `.env` and fill in:
 | `NTPPOOL_IPV4` | no | This server's public IPv4; polls its pool.ntp.org monitoring score. Leave empty to skip. |
 | `GEOIPUPDATE_ACCOUNT_ID` / `GEOIPUPDATE_LICENSE_KEY` | no | MaxMind GeoLite2 credentials for client geo/ASN metrics. Leave empty to skip. |
 | `NTP_ASN_TOP_N` | no | Top ASNs kept as distinct labels before folding the rest into `asn="other"` (default `25`). |
+| `CLIENTS_POLL_INTERVAL` | no | Seconds between metric flushes of the passive capture aggregator (default `15`). |
 
 ## Deploy
 
@@ -217,15 +218,19 @@ the container runs with `cap_drop: [ALL]` and `cap_add: [NET_RAW]`.
 Every `CLIENTS_POLL_INTERVAL` seconds (default 15) the collector flushes its in-memory
 aggregates: `ntp_client_requests_total` and `ntp_client_requests_by_asn_total` count
 packets whose destination port is 123; `ntp_client_drops_total` is
-`max(0, requests - responses)` per country per flush, i.e. requests chrony's `ratelimit`
-swallowed; `ntp_clients_active` is the number of distinct IPs seen in the last 300s;
+`max(0, requests - responses)` per country per flush, i.e. requests not answered within
+the flush window, mostly chrony's `ratelimit` drops, with small noise from flush-boundary
+skew and any kernel capture loss (see `ntp_capture_kernel_drops_total`);
+`ntp_clients_active` is the number of distinct IPs seen in the last 300s;
 `ntp_clients_unique_daily` is a HyperLogLog estimate (~1 % error) over 24 hourly sketches;
 `ntp_clients_scrape_success` is 1 while the capture socket is open.
-`ntp_capture_packets_total{direction}` and `ntp_capture_parse_errors_total` are
-self-monitoring. Separately the sidecar polls `ntppool.org`'s public score JSON
-(`ntppool_score`, `ntppool_monitor_score`, `ntppool_monitor_offset_seconds`,
-`ntppool_monitor_rtt_seconds`). Both feed the dashboard's Clients and pool.ntp.org rows.
-NTS-KE (TCP 4460) is not captured.
+`ntp_capture_packets_total{direction}`, `ntp_capture_parse_errors_total`,
+`ntp_capture_loop_errors_total`, and `ntp_capture_kernel_drops_total` are self-monitoring.
+Separately the sidecar polls `ntppool.org`'s public score JSON (`ntppool_score`,
+`ntppool_monitor_score`, `ntppool_monitor_offset_seconds`, `ntppool_monitor_rtt_seconds`).
+Both feed the dashboard's Clients and pool.ntp.org rows. NTS-KE (TCP 4460) is not captured.
+Capture uses an unbound `AF_PACKET` socket and assumes NTP arrives on a single physical
+interface; a bridge whose member is that interface would count each packet twice.
 
 **Privacy**: raw client IPs never leave the Pi and are never written to disk. Each IP is
 geo/ASN-enriched in process memory against local MaxMind databases and then held only as
