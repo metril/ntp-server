@@ -49,6 +49,10 @@ LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "9124"))
 CLIENTS_POLL_INTERVAL = int(os.environ.get("CLIENTS_POLL_INTERVAL", "15"))
 NTPPOOL_POLL_INTERVAL = int(os.environ.get("NTPPOOL_POLL_INTERVAL", "300"))
 
+CAPTURE_RCVBUF_BYTES = 4 << 20
+SOL_PACKET = 263
+PACKET_STATISTICS = 6
+
 NTPPOOL_USER_AGENT = "ntp-server-exporter/1.0 (+github.com/metril/ntp-server)"
 NTPPOOL_URL_TEMPLATE = "https://www.ntppool.org/scores/{ip}/json?limit=10&monitor=*"
 NTPPOOL_OVERALL_URL_TEMPLATE = "https://www.ntppool.org/scores/{ip}/json?limit=1"
@@ -397,6 +401,10 @@ ntp_capture_loop_errors_total = Counter(
     "ntp_capture_loop_errors_total",
     "Unexpected exceptions in the capture loop (geo/prometheus errors etc.), swallowed to keep the daemon alive",
 )
+ntp_capture_kernel_drops_total = Counter(
+    "ntp_capture_kernel_drops_total",
+    "Packets the kernel dropped before the capture socket could read them (PACKET_STATISTICS)",
+)
 
 ntppool_score = Gauge("ntppool_score", "Latest pool.ntp.org score", ["ip"])
 ntppool_monitor_score = Gauge(
@@ -496,6 +504,7 @@ def open_capture_socket():
     """Open an unbound AF_PACKET/SOCK_RAW socket filtered to udp port 123."""
     sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
     try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, CAPTURE_RCVBUF_BYTES)
         attach_filter(sock, build_ntp_bpf())  # buffer only needs to outlive setsockopt
         sock.settimeout(1.0)
     except Exception:
@@ -524,6 +533,7 @@ class PacketCollector:
         self._active = {}  # ip -> last-seen monotonic time
         self._hourly = [HyperLogLog() for _ in range(24)]
         self._hour = None
+        self._sock = None
 
     def _current_bucket(self):
         hour = time.gmtime(self._wall()).tm_hour
@@ -561,8 +571,31 @@ class PacketCollector:
         else:
             self._responses[key] = self._responses.get(key, 0) + 1
 
+    def _read_kernel_drops(self):
+        """Read and reset the kernel's AF_PACKET drop counter for self._sock.
+
+        Returns 0 if there's no socket, it doesn't support getsockopt (fakes
+        in tests), or the read fails.
+        """
+        sock = self._sock
+        if sock is None:
+            return 0
+        getsockopt = getattr(sock, "getsockopt", None)
+        if getsockopt is None:
+            return 0
+        try:
+            raw = getsockopt(SOL_PACKET, PACKET_STATISTICS, 8)
+        except OSError:
+            return 0
+        _tp_packets, tp_drops = struct.unpack("II", raw)
+        return tp_drops
+
     def flush(self):
         self._current_bucket()
+
+        drops = self._read_kernel_drops()
+        if drops:
+            ntp_capture_kernel_drops_total.inc(drops)
 
         requests, self._requests = self._requests, {}
         responses, self._responses = self._responses, {}
@@ -603,6 +636,7 @@ class PacketCollector:
                     ntp_clients_scrape_success.set(0)
                     time.sleep(30)
                     continue
+                self._sock = sock
                 log.info("NTP capture socket open")
                 ntp_clients_scrape_success.set(1)
 
@@ -619,6 +653,7 @@ class PacketCollector:
                     except OSError:
                         pass
                     sock = None
+                    self._sock = None
                     frame = None
 
                 if frame:

@@ -168,6 +168,7 @@ def test_open_capture_socket_attaches_filter_and_returns_the_socket(monkeypatch)
 
     assert result is fake
     assert (socket.SOL_SOCKET, exporter.SO_ATTACH_FILTER) in setsockopt_calls
+    assert (socket.SOL_SOCKET, socket.SO_RCVBUF) in setsockopt_calls
     assert fake.timeout == 1.0
 
 
@@ -258,6 +259,45 @@ def test_run_forever_survives_a_geo_exception_and_keeps_capturing(monkeypatch):
     # first frame raised on geo.resolve and was swallowed; second frame (the
     # third recv() call, after the exception) was handled and counted.
     assert counter(exporter.ntp_capture_packets_total, direction="request") == before_req + 2
+
+
+# --- kernel drop counter ------------------------------------------------
+
+
+def test_flush_reads_kernel_drops_from_a_socket_with_getsockopt():
+    import struct
+
+    clock = FakeClock()
+    c = make(clock)
+
+    class FakeSock:
+        def getsockopt(self, level, optname, buflen):
+            assert level == exporter.SOL_PACKET
+            assert optname == exporter.PACKET_STATISTICS
+            return struct.pack("II", 100, 7)
+
+    c._sock = FakeSock()
+    before = exporter.ntp_capture_kernel_drops_total._value.get()
+    c.flush()
+    assert exporter.ntp_capture_kernel_drops_total._value.get() == before + 7
+
+
+def test_flush_treats_a_socket_without_getsockopt_as_zero_drops():
+    clock = FakeClock()
+    c = make(clock)
+    c._sock = object()  # no getsockopt attribute, like the fakes in other tests
+    before = exporter.ntp_capture_kernel_drops_total._value.get()
+    c.flush()
+    assert exporter.ntp_capture_kernel_drops_total._value.get() == before
+
+
+def test_flush_with_no_socket_reads_zero_drops():
+    clock = FakeClock()
+    c = make(clock)
+    assert c._sock is None
+    before = exporter.ntp_capture_kernel_drops_total._value.get()
+    c.flush()
+    assert exporter.ntp_capture_kernel_drops_total._value.get() == before
 
 
 # --- hourly bucket rotation on flush -------------------------------------
