@@ -52,6 +52,7 @@ NTPPOOL_POLL_INTERVAL = int(os.environ.get("NTPPOOL_POLL_INTERVAL", "300"))
 CAPTURE_RCVBUF_BYTES = 4 << 20
 SOL_PACKET = 263
 PACKET_STATISTICS = 6
+GEOIP_REOPEN_CHECK_SECONDS = 30
 
 NTPPOOL_USER_AGENT = "ntp-server-exporter/1.0 (+github.com/metril/ntp-server)"
 NTPPOOL_URL_TEMPLATE = "https://www.ntppool.org/scores/{ip}/json?limit=10&monitor=*"
@@ -431,7 +432,7 @@ class GeoIPResolver:
     file's mtime changes, with an LRU-cached lookup per IP.
     """
 
-    def __init__(self, geoip_dir, cache_size=8192):
+    def __init__(self, geoip_dir, cache_size=8192, clock=time.monotonic):
         import maxminddb
 
         self._maxminddb = maxminddb
@@ -443,6 +444,8 @@ class GeoIPResolver:
         self._asn_mtime = None
         self._cache_size = cache_size
         self._resolve_cached = lru_cache(maxsize=cache_size)(self._resolve_uncached)
+        self._clock = clock
+        self._last_reopen_check = None
 
     def _reopen_if_needed(self):
         try:
@@ -493,7 +496,13 @@ class GeoIPResolver:
         return resolve_geo(ip, self._country_lookup, self._asn_lookup)
 
     def resolve(self, ip):
-        self._reopen_if_needed()
+        now = self._clock()
+        if (
+            self._last_reopen_check is None
+            or now - self._last_reopen_check >= GEOIP_REOPEN_CHECK_SECONDS
+        ):
+            self._reopen_if_needed()
+            self._last_reopen_check = now
         return self._resolve_cached(ip)
 
 

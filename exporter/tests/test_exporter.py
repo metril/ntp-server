@@ -150,3 +150,28 @@ def test_reopen_if_needed_closes_old_readers_before_replacing(monkeypatch, tmp_p
     assert len(opened) == 4
     assert opened[0].closed and opened[1].closed  # old country/asn readers closed on reopen
     assert not opened[2].closed and not opened[3].closed  # current readers left open
+
+
+def test_resolve_only_stats_the_mtime_every_reopen_check_interval(monkeypatch, tmp_path):
+    t = [1000.0]
+    resolver = GeoIPResolver(str(tmp_path), clock=lambda: t[0])
+    resolver._maxminddb = SimpleNamespace(open_database=lambda path: SimpleNamespace(close=lambda: None))
+
+    getmtime_calls = []
+
+    def fake_getmtime(path):
+        getmtime_calls.append(path)
+        return 1.0
+
+    monkeypatch.setattr(exporter.os.path, "getmtime", fake_getmtime)
+
+    resolver.resolve("203.0.113.1")
+    t[0] += 1.0
+    resolver.resolve("203.0.113.2")
+    # both resolves land within GEOIP_REOPEN_CHECK_SECONDS of the first check,
+    # so the mtime is only stat'd once per file (country + ASN).
+    assert len(getmtime_calls) == 2
+
+    t[0] += exporter.GEOIP_REOPEN_CHECK_SECONDS
+    resolver.resolve("203.0.113.3")
+    assert len(getmtime_calls) == 4
