@@ -15,6 +15,8 @@ requests calls.
 
 import logging
 import os
+import socket
+import struct
 import subprocess
 import threading
 import time
@@ -222,6 +224,69 @@ def parse_ntppool_overall_score(data):
         return None
     newest = max(history, key=lambda h: h.get("ts") or "")
     return newest.get("score")
+
+
+# --- Pure functions: frame parsing ---------------------------------------
+
+ETH_HDR_LEN = 14
+ETHERTYPE_IPV4 = 0x0800
+ETHERTYPE_IPV6 = 0x86DD
+ETHERTYPE_VLAN = 0x8100
+IPPROTO_UDP = 17
+NTP_PORT = 123
+
+
+def parse_frame(frame):
+    """Classify one captured Ethernet frame as NTP request or response.
+
+    Returns ("request", src_ip) when the UDP destination port is 123,
+    ("response", dst_ip) when the UDP source port is 123, else None.
+    Handles an optional 802.1Q tag, IPv4 with a variable IHL, and IPv6 with
+    next-header UDP only (extension headers are not walked). Pure: takes
+    bytes, returns a tuple of text, touches no global state.
+    """
+    n = len(frame)
+    if n < ETH_HDR_LEN:
+        return None
+    ethertype = int.from_bytes(frame[12:14], "big")
+    off = ETH_HDR_LEN
+    if ethertype == ETHERTYPE_VLAN:
+        if n < off + 4:
+            return None
+        ethertype = int.from_bytes(frame[off + 2 : off + 4], "big")
+        off += 4
+
+    if ethertype == ETHERTYPE_IPV4:
+        if n < off + 20:
+            return None
+        ihl = (frame[off] & 0x0F) * 4
+        if ihl < 20 or n < off + ihl:
+            return None
+        if frame[off + 9] != IPPROTO_UDP:
+            return None
+        src = socket.inet_ntop(socket.AF_INET, frame[off + 12 : off + 16])
+        dst = socket.inet_ntop(socket.AF_INET, frame[off + 16 : off + 20])
+        off += ihl
+    elif ethertype == ETHERTYPE_IPV6:
+        if n < off + 40:
+            return None
+        if frame[off + 6] != IPPROTO_UDP:
+            return None
+        src = socket.inet_ntop(socket.AF_INET6, frame[off + 8 : off + 24])
+        dst = socket.inet_ntop(socket.AF_INET6, frame[off + 24 : off + 40])
+        off += 40
+    else:
+        return None
+
+    if n < off + 8:
+        return None
+    sport = int.from_bytes(frame[off : off + 2], "big")
+    dport = int.from_bytes(frame[off + 2 : off + 4], "big")
+    if dport == NTP_PORT:
+        return "request", src
+    if sport == NTP_PORT:
+        return "response", dst
+    return None
 
 
 # --- Metrics -------------------------------------------------------------
