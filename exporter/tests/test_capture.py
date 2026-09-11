@@ -1,7 +1,7 @@
 import socket
 import struct
 
-from exporter import parse_frame
+from exporter import build_ntp_bpf, parse_frame
 
 
 def eth(payload, ethertype=0x0800, vlan=False):
@@ -79,3 +79,25 @@ def test_parse_frame_truncated_frame_returns_none():
     assert parse_frame(frame[:20]) is None
     assert parse_frame(b"\x00" * 6) is None
     assert parse_frame(frame[:-50]) is None  # UDP header cut short
+
+
+# --- cBPF program ---------------------------------------------------------
+
+
+def test_build_ntp_bpf_is_a_whole_number_of_instructions():
+    prog = build_ntp_bpf()
+    assert len(prog) % 8 == 0
+    assert len(prog) // 8 == 20
+
+
+def test_build_ntp_bpf_first_instruction_is_ldh_ethertype():
+    code, jt, jf, k = struct.unpack("HBBI", build_ntp_bpf()[:8])
+    assert (code, jt, jf, k) == (0x28, 0, 0, 12)  # ldh [12]
+
+
+def test_build_ntp_bpf_last_two_instructions_are_accept_then_reject():
+    prog = build_ntp_bpf()
+    accept = struct.unpack("HBBI", prog[-16:-8])
+    reject = struct.unpack("HBBI", prog[-8:])
+    assert accept == (0x06, 0, 0, 0xFFFF)  # ret #65535
+    assert reject == (0x06, 0, 0, 0)  # ret #0

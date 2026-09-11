@@ -13,6 +13,7 @@ access; the collector classes wire them up to real subprocess/maxminddb/
 requests calls.
 """
 
+import ctypes
 import logging
 import os
 import socket
@@ -287,6 +288,81 @@ def parse_frame(frame):
     if sport == NTP_PORT:
         return "response", dst
     return None
+
+
+# --- cBPF filter: "udp port 123" over IPv4 and IPv6 -----------------------
+
+SO_ATTACH_FILTER = 26
+
+# struct sock_filter { __u16 code; __u8 jt; __u8 jf; __u32 k; }
+_BPF_INSN = struct.Struct("HBBI")
+
+# Opcodes used below.
+_LD_H_ABS = 0x28  # ldh  [k]
+_LD_B_ABS = 0x30  # ldb  [k]
+_LD_H_IND = 0x48  # ldh  [x + k]
+_LDX_B_MSH = 0xB1  # ldxb 4*([k]&0xf)
+_JEQ_K = 0x15  # jeq  #k
+_JSET_K = 0x45  # jset #k
+_RET_K = 0x06  # ret  #k
+
+
+def build_ntp_bpf():
+    """Build the packed classic-BPF program equivalent to `udp port 123`.
+
+    Accepts an unfragmented IPv4 UDP datagram (IHL honoured via ldxb) or an
+    IPv6 datagram whose next header is UDP, with source or destination port
+    123; returns 0xFFFF (accept whole frame) or 0 (drop). Jump targets are
+    relative to the instruction after the jump, so the indices below are the
+    absolute instruction numbers: 18 = accept, 19 = reject.
+    """
+    prog = [
+        # 0: ethertype
+        (_LD_H_ABS, 0, 0, 12),
+        (_JEQ_K, 1, 0, ETHERTYPE_IPV4),  # 1 -> 3 (v4) else 2
+        (_JEQ_K, 9, 16, ETHERTYPE_IPV6),  # 2 -> 12 (v6) else 19
+        # IPv4
+        (_LD_B_ABS, 0, 0, 23),  # 3: protocol
+        (_JEQ_K, 0, 14, IPPROTO_UDP),  # 4 -> 5 else 19
+        (_LD_H_ABS, 0, 0, 20),  # 5: flags + fragment offset
+        (_JSET_K, 12, 0, 0x1FFF),  # 6: fragment -> 19 else 7
+        (_LDX_B_MSH, 0, 0, ETH_HDR_LEN),  # 7: X = IHL * 4
+        (_LD_H_IND, 0, 0, 14),  # 8: source port
+        (_JEQ_K, 8, 0, NTP_PORT),  # 9 -> 18 else 10
+        (_LD_H_IND, 0, 0, 16),  # 10: destination port
+        (_JEQ_K, 6, 7, NTP_PORT),  # 11 -> 18 else 19
+        # IPv6
+        (_LD_B_ABS, 0, 0, 20),  # 12: next header
+        (_JEQ_K, 0, 5, IPPROTO_UDP),  # 13 -> 14 else 19
+        (_LD_H_ABS, 0, 0, 54),  # 14: source port
+        (_JEQ_K, 2, 0, NTP_PORT),  # 15 -> 18 else 16
+        (_LD_H_ABS, 0, 0, 56),  # 16: destination port
+        (_JEQ_K, 0, 1, NTP_PORT),  # 17 -> 18 else 19
+        (_RET_K, 0, 0, 0xFFFF),  # 18: accept
+        (_RET_K, 0, 0, 0),  # 19: reject
+    ]
+    return b"".join(_BPF_INSN.pack(*insn) for insn in prog)
+
+
+class _SockFprog(ctypes.Structure):
+    # struct sock_fprog { unsigned short len; struct sock_filter *filter; }
+    _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.c_void_p)]
+
+
+def attach_filter(sock, program):
+    """Attach a packed cBPF `program` to `sock` via SO_ATTACH_FILTER.
+
+    Returns the ctypes buffer holding the program; the kernel copies it
+    during setsockopt, but the buffer must outlive the call itself.
+    """
+    buf = ctypes.create_string_buffer(program, len(program))
+    fprog = _SockFprog(len(program) // _BPF_INSN.size, ctypes.cast(buf, ctypes.c_void_p))
+    sock.setsockopt(
+        socket.SOL_SOCKET,
+        SO_ATTACH_FILTER,
+        ctypes.string_at(ctypes.addressof(fprog), ctypes.sizeof(fprog)),
+    )
+    return buf
 
 
 # --- Metrics -------------------------------------------------------------
