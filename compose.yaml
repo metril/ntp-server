@@ -82,21 +82,20 @@ services:
     container_name: ntp-clients-exporter
     restart: unless-stopped
     network_mode: host
-    # Same chrony uid:gid as chrony-exporter - needed to read the chronyd
-    # unix socket and create its own reply socket under /run/chrony.
-    user: "100:101"
 
     environment:
       NTPPOOL_IPV4: ${NTPPOOL_IPV4:-}
       NTP_ASN_TOP_N: ${NTP_ASN_TOP_N:-25}
 
     volumes:
-      - chrony-run:/run/chrony
       - geoip:/geoip:ro
 
-    depends_on:
-      chrony:
-        condition: service_healthy
+    # Passive capture only: an unbound AF_PACKET socket with a cBPF
+    # `udp port 123` filter. No chronyd socket, no other privileges.
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_RAW
 
     security_opt:
       - no-new-privileges:true

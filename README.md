@@ -13,15 +13,19 @@ NTS clients ──TCP 4460──▶  │                               │
                             │                                │
                     chrony-exporter ──127.0.0.1:9123──▶ Alloy ──remote_write──▶ VictoriaMetrics
                                                           │  └─loki push───────▶ VictoriaLogs
+                    ntp-clients-exporter ─127.0.0.1:9124──┘
+                      └─AF_PACKET (NET_RAW) sniffs UDP 123 off the wire
                                                 docker.sock (container logs)
 ```
 
-All three containers run `network_mode: host`. `chrony`'s control socket
+All four containers run `network_mode: host`. `chrony`'s control socket
 (`bindcmdaddress /run/chrony/chronyd.sock`, `cmdport 0`) is a unix socket on a
 named volume shared only with `chrony-exporter` (needed for `serverstats`/`clients`,
 which chronyd refuses over the UDP control protocol); `chrony-exporter`/Alloy's
 listeners are loopback-only — only UDP 123 (and TCP 4460 for NTS) are reachable
-from outside the host.
+from outside the host. `ntp-clients-exporter` never talks to chronyd; it reads UDP 123
+straight off the wire with an `AF_PACKET` socket and a kernel-side BPF filter, which is
+why it holds `NET_RAW`.
 
 ## Host prep (Orange Pi)
 
@@ -98,7 +102,7 @@ Copy `.env.example` to `.env` and fill in:
 | `DOCKER_GID` | yes | From `scripts/check-host.sh`; lets Alloy read `docker.sock`. |
 | `POOL_SERVERS` | no | Extra space-separated fallback NTP servers (added on top of the built-in `time.cloudflare.com`, `time.nist.gov`, `pool 2.pool.ntp.org`). |
 | `RATELIMIT_INTERVAL` / `RATELIMIT_BURST` | no | `ratelimit` line defaults (`3` / `8`). |
-| `CLIENTLOGLIMIT` | no | Bytes of per-client log memory (default `16777216`); never set `noclientlog`, it disables `ratelimit` and the `clients` metrics. |
+| `CLIENTLOGLIMIT` | no | Bytes of per-client log memory (default `16777216`); never set `noclientlog`, it disables `ratelimit`. |
 | `NTS_ENABLED` | no | `true` to enable NTS (see below); default `false`. |
 | `NTS_CERT_DIR` | if NTS | Host directory containing an externally-renewed cert/key, mounted read-only at `/certs` (mount the directory, not the files, so renewal isn't orphaned by inode pinning — see `.env.example` for the Let's Encrypt symlink caveat). |
 | `NTS_CERT_NAME` / `NTS_KEY_NAME` | no | Cert/key paths relative to `NTS_CERT_DIR` (default `fullchain.pem` / `privkey.pem`). |
@@ -197,21 +201,37 @@ chrony_serverstats_client_log_records_dropped_total
 
 If this counter is climbing, the client log is full and `ratelimit` can no longer track
 new clients accurately — raise `CLIENTLOGLIMIT` in `.env` and redeploy. Don't disable
-tracking (`noclientlog`) to fix it — that kills both `ratelimit` and the `chrony_clients_*`
-metrics.
+tracking (`noclientlog`) to fix it — that kills `ratelimit`. It does **not** affect the
+client geography metrics: those come from passive packet capture, not chronyd's client
+table.
 
 ## Client geography + pool.ntp.org score
 
-The `ntp-clients-exporter` sidecar polls `chronyc clients` every 60s to export per-country
-and per-ASN request/drop counters (`ntp_client_requests_total`, `ntp_client_drops_total`,
-`ntp_client_requests_by_asn_total`) plus active/unique-client gauges, and separately polls
-`ntppool.org`'s public score JSON for this server's monitoring score
+The `ntp-clients-exporter` sidecar captures NTP packets passively. It opens an unbound
+`AF_PACKET`/`SOCK_RAW` socket with a kernel-side classic-BPF filter equivalent to
+`udp port 123` (IPv4 and IPv6), so the kernel discards everything else before it reaches
+userspace. chronyd is never queried — at pool traffic rates a `chronyc clients` dump can't
+finish, and asking for one competes with serving NTP on chronyd's own thread. This is why
+the container runs with `cap_drop: [ALL]` and `cap_add: [NET_RAW]`.
+
+Every `CLIENTS_POLL_INTERVAL` seconds (default 15) the collector flushes its in-memory
+aggregates: `ntp_client_requests_total` and `ntp_client_requests_by_asn_total` count
+packets whose destination port is 123; `ntp_client_drops_total` is
+`max(0, requests - responses)` per country per flush, i.e. requests chrony's `ratelimit`
+swallowed; `ntp_clients_active` is the number of distinct IPs seen in the last 300s;
+`ntp_clients_unique_daily` is a HyperLogLog estimate (~1 % error) over 24 hourly sketches;
+`ntp_clients_scrape_success` is 1 while the capture socket is open.
+`ntp_capture_packets_total{direction}` and `ntp_capture_parse_errors_total` are
+self-monitoring. Separately the sidecar polls `ntppool.org`'s public score JSON
 (`ntppool_score`, `ntppool_monitor_score`, `ntppool_monitor_offset_seconds`,
 `ntppool_monitor_rtt_seconds`). Both feed the dashboard's Clients and pool.ntp.org rows.
+NTS-KE (TCP 4460) is not captured.
 
-**Privacy**: raw client IPs never leave the Pi. The exporter geo/ASN-enriches each IP in
-memory against local MaxMind databases and only exports country/ASN labels and counts —
-no IP-labeled metric or log line is produced.
+**Privacy**: raw client IPs never leave the Pi and are never written to disk. Each IP is
+geo/ASN-enriched in process memory against local MaxMind databases and then held only as
+a last-seen timestamp in the 300s active window and as hashed bits in the HyperLogLog
+sketches. Only country/ASN labels and counts are exported — no IP-labeled metric, and no
+IP in any log line.
 
 Setup:
 
@@ -258,6 +278,9 @@ Setup:
   container (should be the socket path / `0`), that both containers mount `chrony-run`,
   that `chrony-exporter`'s `user:` in compose.yaml matches the `chrony` uid:gid baked into
   the image, and that the `chrony` container's healthcheck (`chronyc tracking`) is passing.
+- **`ntp_clients_scrape_success` is `0`**: `ntp-clients-exporter` couldn't open its
+  `AF_PACKET` socket. Check that the service has `cap_add: [NET_RAW]` and is not pinned to
+  a `user:` in compose.yaml; the exporter retries the open every 30s and logs the errno.
 - **No logs in VictoriaLogs**: confirm Docker's logging driver is `json-file` or `local`
   (`scripts/check-host.sh` checks this) — Alloy's `loki.source.docker` can't tail
   `journald` or other drivers.
