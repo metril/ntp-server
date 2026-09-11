@@ -20,7 +20,7 @@ NTS clients ──TCP 4460──▶  │                               │
 
 All four containers run `network_mode: host`. `chrony`'s control socket
 (`bindcmdaddress /run/chrony/chronyd.sock`, `cmdport 0`) is a unix socket on a
-named volume shared only with `chrony-exporter` (needed for `serverstats`/`clients`,
+named volume shared only with `chrony-exporter` (needed for `serverstats`,
 which chronyd refuses over the UDP control protocol); `chrony-exporter`/Alloy's
 listeners are loopback-only — only UDP 123 (and TCP 4460 for NTS) are reachable
 from outside the host. `ntp-clients-exporter` never talks to chronyd; it reads UDP 123
@@ -283,6 +283,9 @@ Setup:
   container (should be the socket path / `0`), that both containers mount `chrony-run`,
   that `chrony-exporter`'s `user:` in compose.yaml matches the `chrony` uid:gid baked into
   the image, and that the `chrony` container's healthcheck (`chronyc tracking`) is passing.
+  If `scrape_duration_seconds{job="chrony"}` sits at exactly 5 s, a collector is hitting
+  `--chrony.timeout`; never re-enable `--collector.clients` on this exporter, the client
+  table is far too large to page over cmdmon.
 - **`ntp_clients_scrape_success` is `0`**: `ntp-clients-exporter` couldn't open its
   `AF_PACKET` socket. Check that the service has `cap_add: [NET_RAW]` and is not pinned to
   a `user:` in compose.yaml; the exporter retries the open every 30s and logs the errno.

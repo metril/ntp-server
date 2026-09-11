@@ -1282,12 +1282,21 @@
             "type": "victoriametrics-metrics-datasource",
             "uid": "${datasource}"
           },
-          "expr": "sum by (protocol) (chrony_clients_connected{host=\"$host\"})",
-          "legendFormat": "{{protocol}}",
+          "expr": "ntp_clients_active{host=\"$host\"}",
+          "legendFormat": "active (5m)",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "victoriametrics-metrics-datasource",
+            "uid": "${datasource}"
+          },
+          "expr": "ntp_clients_unique_daily{host=\"$host\"}",
+          "legendFormat": "unique (24h)",
+          "refId": "B"
         }
       ],
-      "title": "Clients connected",
+      "title": "Clients seen",
       "type": "stat"
     },
     {

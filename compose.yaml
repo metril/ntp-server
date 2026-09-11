@@ -61,13 +61,15 @@ services:
       - chrony-run:/run/chrony
 
     command:
-      # serverstats/clients require the unix command socket - chronyd
-      # rejects them over the UDP cmdport.
+      # serverstats requires the unix command socket - chronyd rejects it
+      # over the UDP cmdport. --collector.clients is deliberately off: it
+      # pages the whole client table over cmdmon (millions of records under
+      # pool load), never finishes inside --chrony.timeout, and flips
+      # chrony_up to 0. ntp-clients-exporter covers client stats passively.
       - --chrony.address=unix:///run/chrony/chronyd.sock
       - --web.listen-address=127.0.0.1:9123
       - --collector.sources
       - --collector.serverstats
-      - --collector.clients
       - --no-collector.dns-lookups
 
     depends_on:
