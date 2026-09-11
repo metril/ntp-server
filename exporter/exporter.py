@@ -329,7 +329,9 @@ class HyperLogLog:
         self.registers = bytearray(self.m)
 
     def add(self, key):
-        h = int.from_bytes(hashlib.sha1(key.encode("utf-8")).digest()[:8], "big")
+        h = int.from_bytes(
+            hashlib.sha1(key.encode("utf-8"), usedforsecurity=False).digest()[:8], "big"
+        )
         idx = h >> self._bits
         w = h & ((1 << self._bits) - 1)
         rho = self._bits + 1 if w == 0 else self._bits - w.bit_length() + 1
@@ -390,6 +392,10 @@ ntp_capture_packets_total = Counter(
 ntp_capture_parse_errors_total = Counter(
     "ntp_capture_parse_errors_total",
     "Frames that passed the BPF filter but could not be parsed",
+)
+ntp_capture_loop_errors_total = Counter(
+    "ntp_capture_loop_errors_total",
+    "Unexpected exceptions in the capture loop (geo/prometheus errors etc.), swallowed to keep the daemon alive",
 )
 
 ntppool_score = Gauge("ntppool_score", "Latest pool.ntp.org score", ["ip"])
@@ -556,6 +562,8 @@ class PacketCollector:
             self._responses[key] = self._responses.get(key, 0) + 1
 
     def flush(self):
+        self._current_bucket()
+
         requests, self._requests = self._requests, {}
         responses, self._responses = self._responses, {}
         asn_requests, self._asn_requests = self._asn_requests, {}
@@ -599,26 +607,31 @@ class PacketCollector:
                 ntp_clients_scrape_success.set(1)
 
             try:
-                frame = sock.recv(65535)
-            except TimeoutError:
-                frame = None
-            except OSError:
-                log.exception("NTP capture socket read failed; reopening")
-                ntp_clients_scrape_success.set(0)
                 try:
-                    sock.close()
+                    frame = sock.recv(65535)
+                except TimeoutError:
+                    frame = None
                 except OSError:
-                    pass
-                sock = None
-                frame = None
+                    log.exception("NTP capture socket read failed; reopening")
+                    ntp_clients_scrape_success.set(0)
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    sock = None
+                    frame = None
 
-            if frame:
-                self.handle_frame(frame)
+                if frame:
+                    self.handle_frame(frame)
 
-            now = self._clock()
-            if now - last_flush >= interval:
-                self.flush()
-                last_flush = now
+                now = self._clock()
+                if now - last_flush >= interval:
+                    self.flush()
+                    last_flush = now
+            except Exception:
+                log.exception("capture loop error")
+                ntp_capture_loop_errors_total.inc()
+                continue
 
 
 # --- ntppool collector -----------------------------------------------------

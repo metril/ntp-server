@@ -179,7 +179,10 @@ def test_run_forever_recovers_from_a_sock_factory_error(monkeypatch):
     sleeps = []
     monkeypatch.setattr(exporter.time, "sleep", lambda s: sleeps.append(s))
 
-    class StopCapture(Exception):
+    class StopCapture(BaseException):
+        # Not an Exception subclass: run_forever's per-iteration body now
+        # swallows plain Exceptions (see the loop-error test below), so the
+        # test needs a BaseException to still break out of the `while True`.
         pass
 
     class FakeSock:
@@ -211,3 +214,70 @@ def test_run_forever_recovers_from_a_sock_factory_error(monkeypatch):
 
     assert sleeps == [30]
     assert success_values == [0, 1]
+
+
+def test_run_forever_survives_a_geo_exception_and_keeps_capturing(monkeypatch):
+    clock = FakeClock()
+
+    calls = [0]
+
+    def flaky_resolve(ip):
+        calls[0] += 1
+        if calls[0] == 2:
+            raise RuntimeError("geoip exploded")
+        return ("US", "NA", 64500, "TestOrg")
+
+    geo = SimpleNamespace(resolve=flaky_resolve)
+
+    class StopCapture(BaseException):
+        pass
+
+    frames = [request_frame("192.0.2.1"), request_frame("192.0.2.2"), None]
+
+    class FakeSock:
+        def recv(self, n):
+            if not frames:
+                raise StopCapture()
+            f = frames.pop(0)
+            if f is None:
+                raise TimeoutError()
+            return f
+
+        def close(self):
+            pass
+
+    c = PacketCollector(geo, 25, lambda: FakeSock(), clock=clock, wall=lambda: 0.0)
+
+    before = exporter.ntp_capture_loop_errors_total._value.get()
+    before_req = counter(exporter.ntp_capture_packets_total, direction="request")
+
+    with pytest.raises(StopCapture):
+        c.run_forever(15)
+
+    assert exporter.ntp_capture_loop_errors_total._value.get() == before + 1
+    # first frame raised on geo.resolve and was swallowed; second frame (the
+    # third recv() call, after the exception) was handled and counted.
+    assert counter(exporter.ntp_capture_packets_total, direction="request") == before_req + 2
+
+
+# --- hourly bucket rotation on flush -------------------------------------
+
+
+def test_flush_rotates_hourly_buckets_even_during_a_silent_period():
+    clock = FakeClock()
+    hour = [3]
+    c = PacketCollector(fake_geo(), 25, lambda: None, clock=clock, wall=lambda: hour[0] * 3600.0)
+    c.handle_frame(request_frame("192.0.2.30"))
+    assert c._hourly[3].count() >= 1
+
+    for h in (4, 5, 6, 7):
+        c._hourly[h].add("stale-yesterday")
+
+    hour[0] = 7
+    c.flush()  # no frames arrived; only flush() advances the wall clock view
+
+    assert c._hour == 7
+    for h in (4, 5, 6, 7):
+        assert c._hourly[h].count() == 0
+    assert c._hourly[3].count() >= 1
+    assert exporter.ntp_clients_unique_daily._value.get() >= 1
