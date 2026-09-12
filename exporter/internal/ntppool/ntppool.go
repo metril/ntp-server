@@ -38,8 +38,53 @@ type monitorMeta struct {
 	Name *string `json:"name"`
 }
 
+// flexTS accepts history[].ts as either an epoch number (what ntppool.org
+// actually sends) or an ISO-8601 string (older/other renderings). Numeric
+// values compare numerically; strings compare lexically; a number always
+// sorts after a string so mixed payloads still pick a deterministic newest.
+type flexTS struct {
+	num   float64
+	str   string
+	isNum bool
+	set   bool
+}
+
+func (t *flexTS) UnmarshalJSON(b []byte) error {
+	if string(b) == "null" {
+		return nil
+	}
+	if b[0] == '"' {
+		if err := json.Unmarshal(b, &t.str); err != nil {
+			return err
+		}
+		t.set = true
+		return nil
+	}
+	if err := json.Unmarshal(b, &t.num); err != nil {
+		return err
+	}
+	t.isNum, t.set = true, true
+	return nil
+}
+
+// less reports whether t sorts before o.
+func (t flexTS) less(o flexTS) bool {
+	switch {
+	case !t.set:
+		return o.set
+	case !o.set:
+		return false
+	case t.isNum && o.isNum:
+		return t.num < o.num
+	case t.isNum != o.isNum:
+		return !t.isNum
+	default:
+		return t.str < o.str
+	}
+}
+
 type historyEntry struct {
-	TS        *string  `json:"ts"`
+	TS        flexTS   `json:"ts"`
 	Score     *float64 `json:"score"`
 	Offset    *float64 `json:"offset"`
 	RTT       *float64 `json:"rtt"`
@@ -51,11 +96,9 @@ type scoreResponse struct {
 	History  []historyEntry `json:"history"`
 }
 
-func tsOf(h historyEntry) string {
-	if h.TS == nil {
-		return ""
-	}
-	return *h.TS
+// newer reports whether a's timestamp is strictly after b's.
+func newer(a, b historyEntry) bool {
+	return b.TS.less(a.TS)
 }
 
 // Parse parses the per-monitor (monitor=*) ntppool.org score JSON body.
@@ -82,7 +125,7 @@ func Parse(data []byte) (Parsed, error) {
 	if len(resp.History) > 0 {
 		newest := resp.History[0]
 		for _, h := range resp.History[1:] {
-			if tsOf(h) > tsOf(newest) {
+			if newer(h, newest) {
 				newest = h
 			}
 		}
@@ -96,7 +139,7 @@ func Parse(data []byte) (Parsed, error) {
 		}
 		mid := *h.MonitorID
 		cur, ok := latestByMonitor[mid]
-		if !ok || tsOf(h) > tsOf(cur) {
+		if !ok || newer(h, cur) {
 			latestByMonitor[mid] = h
 		}
 	}
@@ -134,7 +177,7 @@ func ParseOverallScore(data []byte) (*float64, error) {
 	}
 	newest := resp.History[0]
 	for _, h := range resp.History[1:] {
-		if tsOf(h) > tsOf(newest) {
+		if newer(h, newest) {
 			newest = h
 		}
 	}

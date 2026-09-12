@@ -108,3 +108,27 @@ func TestParseOverallScoreEmptyHistory(t *testing.T) {
 		t.Fatalf("expected nil, got %v", *score)
 	}
 }
+
+// Real ntppool.org responses carry history[].ts as an epoch integer
+// (monitors[].ts is an ISO string). Captured 2026-09-12.
+func TestParseNumericHistoryTS(t *testing.T) {
+	data := []byte(`{"history":[{"ts":1789224495,"offset":0.001,"step":1,"score":15.0,"monitor_id":382,"rtt":300.0},{"ts":1789224602,"offset":0.002,"step":1,"score":16.5,"monitor_id":382,"rtt":178.0}],"monitors":[{"id":382,"name":"aubne1","type":"monitor","ts":"2026-09-12T14:50:02Z","score":16.1}]}`)
+	result, err := Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Score == nil || !approx(*result.Score, 16.5) {
+		t.Fatalf("expected newest score 16.5, got %v", result.Score)
+	}
+	m := result.Monitors["aubne1"]
+	if m.Score == nil || !approx(*m.Score, 16.5) {
+		t.Fatalf("expected newest monitor score 16.5, got %v", m.Score)
+	}
+	overall, err := ParseOverallScore(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overall == nil || !approx(*overall, 16.5) {
+		t.Fatalf("expected overall 16.5, got %v", overall)
+	}
+}
