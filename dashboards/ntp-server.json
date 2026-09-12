@@ -338,7 +338,8 @@
               }
             ]
           },
-          "unit": "none"
+          "unit": "none",
+          "noValue": "poll failing"
         },
         "overrides": []
       },
@@ -373,13 +374,14 @@
             "type": "victoriametrics-metrics-datasource",
             "uid": "${datasource}"
           },
-          "expr": "ntppool_score{host=\"$host\"}",
+          "expr": "ntppool_score{host=\"$host\"} and on(host) ntppool_scrape_success{host=\"$host\"} == 1",
           "legendFormat": "score",
           "refId": "A"
         }
       ],
       "title": "pool.ntp.org score",
-      "type": "stat"
+      "type": "stat",
+      "description": "Overall pool.ntp.org score. Shows \"poll failing\" when the exporter's last ntppool.org poll did not succeed (ntppool_scrape_success == 0), instead of a stale last value."
     },
     {
       "datasource": {
