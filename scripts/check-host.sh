@@ -192,22 +192,99 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# net.core.rmem_max must be large enough that the exporter's capture socket
-# SO_RCVBUF request isn't silently capped -- a capped buffer overflows under
-# load and packets are dropped before userspace ever sees them.
+# net.core.rmem_max/rmem_default/netdev_max_backlog must be large enough
+# that the exporter's TPACKET_V3 ring (64 MiB default, NTP_CAPTURE_RING_BYTES)
+# and the NIC's per-CPU backlog aren't silently capped -- a capped buffer
+# overflows under 5K req/s load and packets are dropped before userspace
+# ever sees them.
 # ---------------------------------------------------------------------------
 if command -v sysctl >/dev/null 2>&1; then
     rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
-    if [ "$rmem_max" -lt 8388608 ]; then
+    rmem_default=$(sysctl -n net.core.rmem_default 2>/dev/null || echo 0)
+    netdev_backlog=$(sysctl -n net.core.netdev_max_backlog 2>/dev/null || echo 0)
+    sysctl_bad=0
+    [ "$rmem_max" -lt 67108864 ] && sysctl_bad=1
+    [ "$rmem_default" -lt 16777216 ] && sysctl_bad=1
+    [ "$netdev_backlog" -lt 5000 ] && sysctl_bad=1
+    if [ "$sysctl_bad" -eq 1 ]; then
         offer_fix \
-            "net.core.rmem_max is ${rmem_max} bytes, below the 8388608 the capture socket requests" \
-            "sh -c 'echo \"net.core.rmem_max = 8388608\" > /etc/sysctl.d/90-ntp-capture.conf && chmod 0644 /etc/sysctl.d/90-ntp-capture.conf && sysctl --system'" \
+            "net.core.rmem_max=${rmem_max} rmem_default=${rmem_default} netdev_max_backlog=${netdev_backlog}, below the 67108864/16777216/5000 the capture path needs" \
+            "sh -c 'printf \"net.core.rmem_max = 67108864\nnet.core.rmem_default = 16777216\nnet.core.netdev_max_backlog = 5000\n\" > /etc/sysctl.d/90-ntp-capture.conf && chmod 0644 /etc/sysctl.d/90-ntp-capture.conf && sysctl --system'" \
             warn
     else
-        info "net.core.rmem_max is ${rmem_max} bytes"
+        info "net.core.rmem_max=${rmem_max} rmem_default=${rmem_default} netdev_max_backlog=${netdev_backlog}"
     fi
 else
-    warn "sysctl not found, cannot check net.core.rmem_max"
+    warn "sysctl not found, cannot check net.core.rmem_max/rmem_default/netdev_max_backlog"
+fi
+
+# ---------------------------------------------------------------------------
+# RT group scheduling (cpu.rt_runtime_us) throttles SCHED_FIFO/SCHED_RR
+# threads outside their allotted runtime; if the cgroup controller is
+# active, chronyd's sched_priority (CHRONY_SCHED_PRIORITY) may be silently
+# denied or throttled even though the container has CAP_SYS_NICE.
+# ---------------------------------------------------------------------------
+rt_cgroup_found=""
+for rt_runtime_file in \
+    /sys/fs/cgroup/cpu.rt_runtime_us \
+    /sys/fs/cgroup/cpu/cpu.rt_runtime_us \
+    /sys/fs/cgroup/cpu,cpuacct/cpu.rt_runtime_us
+do
+    if [ -e "$rt_runtime_file" ]; then
+        warn "RT group scheduling is active ($rt_runtime_file exists) - this can block chronyd's SCHED_FIFO request; verify with: chrt -p \$(pidof chronyd)"
+        rt_cgroup_found=1
+    fi
+done
+if [ -z "$rt_cgroup_found" ]; then
+    info "no cpu.rt_runtime_us cgroup found (RT group scheduling not restricting SCHED_FIFO)"
+fi
+
+# ---------------------------------------------------------------------------
+# Pin the eth0 RX IRQ(s) to cpu 5, alongside chrony's cpuset (compose.yaml
+# pins chrony to cpus 4,5) so interrupt handling and chronyd share an A76
+# core close to each other instead of contending with the capture exporter
+# (pinned to 6,7).
+# ---------------------------------------------------------------------------
+eth0_irqs=$(grep -E 'eth0' /proc/interrupts 2>/dev/null | awk -F: '{print $1}' | tr -d ' ')
+if [ -z "$eth0_irqs" ]; then
+    warn "no eth0 IRQ found in /proc/interrupts, skipping IRQ affinity pin"
+else
+    for irq in $eth0_irqs; do
+        affinity_file="/proc/irq/${irq}/smp_affinity_list"
+        if [ ! -w "$affinity_file" ] && [ "$(id -u)" != "0" ] && ! command -v sudo >/dev/null 2>&1; then
+            warn "cannot write $affinity_file (no root/sudo) - pin eth0 IRQ $irq to cpu 5 manually"
+            continue
+        fi
+        current=$(cat "$affinity_file" 2>/dev/null || echo "?")
+        if [ "$current" = "5" ]; then
+            info "eth0 IRQ $irq already pinned to cpu 5"
+        else
+            offer_fix \
+                "eth0 IRQ $irq affinity is '$current', not pinned to cpu 5" \
+                "sh -c 'echo 5 > $affinity_file'" \
+                warn
+        fi
+    done
+fi
+
+# ---------------------------------------------------------------------------
+# CLIENTLOGLIMIT (from .env, default 268435456 = 256 MiB) needs headroom on
+# an 8 GB Pi; on a much smaller host it could pressure chronyd/the kernel
+# page cache. Only a FAIL-worthy sanity check, not a tuning recommendation.
+# ---------------------------------------------------------------------------
+env_file="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/.env"
+clientloglimit=268435456
+if [ -f "$env_file" ]; then
+    file_value=$(grep -E '^CLIENTLOGLIMIT=' "$env_file" 2>/dev/null | tail -n1 | cut -d= -f2-)
+    [ -n "$file_value" ] && clientloglimit="$file_value"
+fi
+if [ "$clientloglimit" -gt 67108864 ] 2>/dev/null; then
+    mem_total_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    if [ "$mem_total_kb" -lt 2097152 ]; then
+        fail "CLIENTLOGLIMIT=${clientloglimit} (>64 MiB) but MemTotal is only ${mem_total_kb} kB (<2 GB) - lower CLIENTLOGLIMIT in .env or add RAM"
+    else
+        info "CLIENTLOGLIMIT=${clientloglimit}, MemTotal=${mem_total_kb} kB (>=2 GB, OK)"
+    fi
 fi
 
 # ---------------------------------------------------------------------------

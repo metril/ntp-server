@@ -10,18 +10,25 @@ services:
     environment:
       GRANDMASTER_HOST: ${GRANDMASTER_HOST:?set GRANDMASTER_HOST in .env}
       POOL_SERVERS: ${POOL_SERVERS:-}
-      RATELIMIT_INTERVAL: ${RATELIMIT_INTERVAL:-3}
-      RATELIMIT_BURST: ${RATELIMIT_BURST:-8}
-      RATELIMIT_LEAK: ${RATELIMIT_LEAK:-2}
-      CLIENTLOGLIMIT: ${CLIENTLOGLIMIT:-16777216}
+      RATELIMIT_INTERVAL: ${RATELIMIT_INTERVAL:--4}
+      RATELIMIT_BURST: ${RATELIMIT_BURST:-16}
+      RATELIMIT_LEAK: ${RATELIMIT_LEAK:-1}
+      CLIENTLOGLIMIT: ${CLIENTLOGLIMIT:-268435456}
       NTS_ENABLED: ${NTS_ENABLED:-false}
+      CHRONY_SCHED_PRIORITY: ${CHRONY_SCHED_PRIORITY:-1}
 
     volumes:
       - ./chrony-data:/var/lib/chrony
       - chrony-run:/run/chrony
 
+    # Pinned off the A55 cluster (0-3) onto the A76 cores so packet/clock
+    # handling isn't preempted by little-core scheduling noise.
+    cpuset: "4,5"
+
     # Alpine chronyd binds ports then drops privs to the `chrony` user.
-    # Trim these after testing on the Pi if some prove unnecessary.
+    # Trim these after testing on the Pi if some prove unnecessary. SYS_NICE
+    # and IPC_LOCK back CHRONY_SCHED_PRIORITY's sched_priority/lock_all (see
+    # chrony.conf.template) - chronyd degrades gracefully without them.
     cap_drop:
       - ALL
     cap_add:
@@ -31,6 +38,8 @@ services:
       - SETGID
       - CHOWN
       - DAC_OVERRIDE
+      - SYS_NICE
+      - IPC_LOCK
 
     security_opt:
       - no-new-privileges:true
@@ -95,12 +104,20 @@ services:
       NTPPOOL_IPV4: ${NTPPOOL_IPV4:-}
       NTP_ASN_TOP_N: ${NTP_ASN_TOP_N:-25}
       CLIENTS_POLL_INTERVAL: ${CLIENTS_POLL_INTERVAL:-15}
+      NTP_CAPTURE_WORKERS: ${NTP_CAPTURE_WORKERS:-4}
+      NTP_CAPTURE_RING_BYTES: ${NTP_CAPTURE_RING_BYTES:-67108864}
 
     volumes:
       - geoip:/geoip:ro
 
-    # Passive capture only: an unbound AF_PACKET socket with a cBPF
-    # `udp port 123` filter. No chronyd socket, no other privileges.
+    # Pinned off the A55 cluster (0-3), separate from chrony's 4,5, so
+    # capture worker threads don't contend with chronyd for A76 cycles.
+    cpuset: "6,7"
+
+    # Passive capture only: the exporter is Go, reading a TPACKET_V3 ring
+    # buffer fanned out (PACKET_FANOUT) across NTP_CAPTURE_WORKERS threads.
+    # Still just an unbound AF_PACKET socket with a cBPF `udp port 123`
+    # filter - no chronyd socket, no other privileges.
     cap_drop:
       - ALL
     cap_add:

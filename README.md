@@ -72,13 +72,21 @@ It reports:
   Orange Pi 5's hwmon names (`*_thermal` + `nvme`, matched on the `chip_name` label); on a
   different board, use these names to edit the panel's `chip_name` regex.
 
-It also checks `net.core.rmem_max`, the kernel's ceiling on a socket's `SO_RCVBUF`. The
-exporter's capture socket requests an 8 MiB buffer so it can absorb a slow flush without
-overflowing, but the kernel silently caps the request at whatever `net.core.rmem_max` is —
-the Linux default (~208 KiB) is only about 100 frames, and once the buffer fills the kernel
-drops packets before they ever reach the exporter (`ntp_capture_kernel_drops_total`, see
-below). The checker offers to raise it via a `sysctl.d` drop-in; it's a `WARN`, not a `FAIL`,
-because a capped buffer degrades under load rather than breaking the container outright.
+It also checks `net.core.rmem_max`/`rmem_default` (kernel ceilings on socket buffers) and
+`net.core.netdev_max_backlog` (per-CPU packet backlog), raised to 64 MiB / 16 MiB / 5000
+respectively to keep up with the exporter's `NTP_CAPTURE_RING_BYTES` (default 64 MiB) at
+5K req/s — the kernel silently caps requests above these, and once a buffer fills it drops
+packets before they ever reach the exporter (`ntp_capture_kernel_drops_total`, see below).
+The checker offers to raise all three via one `sysctl.d` drop-in; it's a `WARN`, not a
+`FAIL`, because a capped buffer degrades under load rather than breaking the container
+outright.
+
+It also warns if RT group scheduling (`/sys/fs/cgroup/cpu.rt_runtime_us`) is active, since
+it can silently throttle chronyd's `CHRONY_SCHED_PRIORITY` real-time priority even with
+`CAP_SYS_NICE` granted — verify with `chrt -p $(pidof chronyd)` — and pins the eth0 RX
+IRQ(s) to cpu 5 (alongside `chrony`'s `cpuset: "4,5"`) so interrupt handling and chronyd
+share cores instead of contending with the exporter on `6,7`. It also asserts at least
+2 GB of RAM when `CLIENTLOGLIMIT` (read from `.env`) is raised above 64 MiB.
 
 It also creates `./chrony-data` next to the compose file if missing. Alloy keeps its state
 (remote_write WAL, log positions) on a 256m tmpfs so it never writes to the Pi's storage;
@@ -109,8 +117,11 @@ Copy `.env.example` to `.env` and fill in:
 | `VL_USER` / `VL_PASSWORD` | yes | Basic auth for `VL_URL`. |
 | `DOCKER_GID` | yes | From `scripts/check-host.sh`; lets Alloy read `docker.sock`. |
 | `POOL_SERVERS` | no | Extra space-separated fallback NTP servers (added on top of the built-in `time.cloudflare.com`, `time.nist.gov`, `pool 2.pool.ntp.org`). |
-| `RATELIMIT_INTERVAL` / `RATELIMIT_BURST` / `RATELIMIT_LEAK` | no | `ratelimit` line defaults (`3` / `8` / `2`); `leak N` still answers 1 in 2^N rate-limited requests. |
-| `CLIENTLOGLIMIT` | no | Bytes of per-client log memory (default `16777216`); never set `noclientlog`, it disables `ratelimit`. |
+| `RATELIMIT_INTERVAL` / `RATELIMIT_BURST` / `RATELIMIT_LEAK` | no | `ratelimit` line defaults (`-4` / `16` / `1`), sized for ~5K req/s pool traffic; see "Rate limit & clientloglimit tuning" below to tighten back down. |
+| `CLIENTLOGLIMIT` | no | Bytes of per-client log memory (default `268435456` = 256 MiB, ~2.6M client records); never set `noclientlog`, it disables `ratelimit`. |
+| `CHRONY_SCHED_PRIORITY` | no | SCHED_FIFO priority for chronyd (default `1`); `0` disables real-time scheduling and `mlockall`. Needs `SYS_NICE`/`IPC_LOCK` (granted in `compose.yaml`); chronyd falls back gracefully if either is denied. |
+| `NTP_CAPTURE_WORKERS` | no | Capture worker threads reading the TPACKET_V3 ring, fanned out via `PACKET_FANOUT` (default `4`). |
+| `NTP_CAPTURE_RING_BYTES` | no | Total size in bytes of the capture ring buffer (default `67108864` = 64 MiB). Raise if `ntp_capture_kernel_drops_total` climbs under load. |
 | `NTS_ENABLED` | no | `true` to enable NTS (see below); default `false`. |
 | `NTS_CERT_DIR` | if NTS | Host directory containing an externally-renewed cert/key, mounted read-only at `/certs` (mount the directory, not the files, so renewal isn't orphaned by inode pinning — see `.env.example` for the Let's Encrypt symlink caveat). |
 | `NTS_CERT_NAME` / `NTS_KEY_NAME` | no | Cert/key paths relative to `NTS_CERT_DIR` (default `fullchain.pem` / `privkey.pem`). |
@@ -169,6 +180,11 @@ sntp <pi-ip-or-hostname>
 
 In VictoriaMetrics/VictoriaLogs:
 
+To load-test the rate-limit/scheduling tuning before relying on real pool traffic, use
+`scripts/ntp-load` to generate synthetic NTP request volume against the Pi and watch
+`ntp_capture_kernel_drops_total` / `chrony_serverstats_client_log_records_dropped_total`
+stay flat at the target rate.
+
 ```
 chrony_tracking_stratum{host="<ALLOY_INSTANCE>"}
 {job="ntp-server"}
@@ -202,7 +218,21 @@ the basemap can be reset to "Default" once you upgrade.
 
 `ratelimit interval ${RATELIMIT_INTERVAL} burst ${RATELIMIT_BURST} leak ${RATELIMIT_LEAK}` in
 `chrony.conf.template` throttles abusive clients; `clientloglimit` bounds the memory used
-to track per-client state for it. Watch:
+to track per-client state for it. The shipped defaults (`-4` / `16` / `1` / `268435456`)
+are sized for ~5K req/s of pool traffic:
+
+- `interval` is log2 seconds between requests a client is allowed before limiting starts —
+  `-4` means 2^4 = 16 responses/s per client before it kicks in (chrony's own default is
+  `3`, one every 8s, far too strict for pool volume).
+- `burst` (`16`) is how many requests above that rate a client can burst before being
+  limited.
+- `leak N` still answers 1 in 2^N rate-limited requests — `1` means 1 in 2 (chrony's
+  default `2` is 1 in 4).
+- `clientloglimit` (`268435456` = 256 MiB) is the memory budget for per-client state; at
+  ~100 bytes/record that's roughly 2.6M tracked clients. `scripts/check-host.sh` requires
+  >=2 GB host RAM whenever this is raised above 64 MiB.
+
+Watch:
 
 ```
 chrony_serverstats_client_log_records_dropped_total
@@ -214,14 +244,38 @@ tracking (`noclientlog`) to fix it — that kills `ratelimit`. It does **not** a
 client geography metrics: those come from passive packet capture, not chronyd's client
 table.
 
+To tighten back toward stock chrony behavior (e.g. after pool.ntp.org traffic settles, or
+if a single client is hammering the server), set in `.env`:
+
+```
+RATELIMIT_INTERVAL=3
+RATELIMIT_BURST=8
+RATELIMIT_LEAK=2
+```
+
+### Real-time scheduling
+
+`CHRONY_SCHED_PRIORITY` (default `1`) runs chronyd's clock/packet handling under
+`SCHED_FIFO` and locks its memory (`lock_all` in `chrony.conf.template`) so it isn't
+preempted or paged out under load. Both are best-effort: chronyd logs a warning and
+continues unprivileged if `sched_setscheduler`/`mlockall` are denied (missing
+`CAP_SYS_NICE`/`CAP_IPC_LOCK`, or RT group scheduling on the host — see
+`scripts/check-host.sh`, which warns if `cpu.rt_runtime_us` is present and suggests
+`chrt -p $(pidof chronyd)` to confirm the priority actually applied). Set it to `0` to
+disable. `compose.yaml` also pins `chrony` to cpus `4,5` and `ntp-clients-exporter` to
+`6,7`, off the Orange Pi 5's A55 cluster (0-3), so both stay on A76 cores without
+contending with each other.
+
 ## Client geography + pool.ntp.org score
 
-The `ntp-clients-exporter` sidecar captures NTP packets passively. It opens an unbound
-`AF_PACKET`/`SOCK_RAW` socket with a kernel-side classic-BPF filter equivalent to
-`udp port 123` (IPv4 and IPv6), so the kernel discards everything else before it reaches
-userspace. chronyd is never queried — at pool traffic rates a `chronyc clients` dump can't
-finish, and asking for one competes with serving NTP on chronyd's own thread. This is why
-the container runs with `cap_drop: [ALL]` and `cap_add: [NET_RAW]`.
+The `ntp-clients-exporter` sidecar (Go) captures NTP packets passively. It opens an unbound
+`AF_PACKET`/`SOCK_RAW` socket in `TPACKET_V3` ring-buffer mode with a kernel-side classic-BPF
+filter equivalent to `udp port 123` (IPv4 and IPv6), so the kernel discards everything else
+before it reaches userspace; `PACKET_FANOUT` spreads ring reads across
+`NTP_CAPTURE_WORKERS` threads for 5K req/s throughput. chronyd is never queried — at pool
+traffic rates a `chronyc clients` dump can't finish, and asking for one competes with
+serving NTP on chronyd's own thread. This is why the container runs with `cap_drop: [ALL]`
+and `cap_add: [NET_RAW]`.
 
 Every `CLIENTS_POLL_INTERVAL` seconds (default 15) the collector flushes its in-memory
 aggregates: `ntp_client_requests_total` and `ntp_client_requests_by_asn_total` count
@@ -234,9 +288,10 @@ skew and any kernel capture loss (see `ntp_capture_kernel_drops_total`);
 `ntp_clients_scrape_success` is 1 while the capture socket is open.
 `ntp_capture_packets_total{direction}`, `ntp_capture_parse_errors_total`,
 `ntp_capture_loop_errors_total`, and `ntp_capture_kernel_drops_total` are self-monitoring.
-`ntp_capture_rcvbuf_bytes` is the capture socket's effective `SO_RCVBUF` as reported by
-`getsockopt` after the request — watch it alongside `ntp_capture_kernel_drops_total`; if
-it's below the requested size, `net.core.rmem_max` is capping it (see "Host prep" above).
+`ntp_capture_rcvbuf_bytes` now reports the total size in bytes of the TPACKET_V3 ring
+buffer (`NTP_CAPTURE_RING_BYTES`) rather than a socket's `SO_RCVBUF` — watch it alongside
+`ntp_capture_kernel_drops_total`; if drops climb, raise `NTP_CAPTURE_RING_BYTES` (and
+confirm `net.core.rmem_max`/`rmem_default` aren't capping it — see "Host prep" above).
 `ntp_geoip_database_loaded{db="country"|"asn"}` is 1 while the corresponding GeoLite2 mmdb
 is open and readable, 0 if it's missing or failed to open.
 `ntp_client_requests_by_version_total{version}` and `ntp_client_requests_by_family_total{family}`

@@ -15,10 +15,12 @@ leapsectz right/UTC
 # ^ commented: Orange Pi often has no RTC.
 
 # Serving.
+lock_all
 allow all
 ratelimit interval ${RATELIMIT_INTERVAL} burst ${RATELIMIT_BURST} leak ${RATELIMIT_LEAK}
 clientloglimit ${CLIENTLOGLIMIT}
 # Never noclientlog - it kills ratelimit and the clients metrics.
+__SCHED_CONFIG__
 
 # Control (unix socket only - shared with chrony-exporter via the
 # chrony-run volume; serverstats/clients metrics require this socket,

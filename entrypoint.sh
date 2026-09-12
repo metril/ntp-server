@@ -17,10 +17,11 @@ NTS_KEY_TMP=/tmp/nts-server.key
 NTS_CERT_TMP=/tmp/nts-server.crt
 
 NTS_ENABLED="${NTS_ENABLED:-false}"
-RATELIMIT_INTERVAL="${RATELIMIT_INTERVAL:-3}"
-RATELIMIT_BURST="${RATELIMIT_BURST:-8}"
-RATELIMIT_LEAK="${RATELIMIT_LEAK:-2}"
-CLIENTLOGLIMIT="${CLIENTLOGLIMIT:-4194304}"
+RATELIMIT_INTERVAL="${RATELIMIT_INTERVAL:--4}"
+RATELIMIT_BURST="${RATELIMIT_BURST:-16}"
+RATELIMIT_LEAK="${RATELIMIT_LEAK:-1}"
+CLIENTLOGLIMIT="${CLIENTLOGLIMIT:-268435456}"
+CHRONY_SCHED_PRIORITY="${CHRONY_SCHED_PRIORITY:-1}"
 POOL_SERVERS="${POOL_SERVERS:-}"
 
 if [ -z "${GRANDMASTER_HOST:-}" ]; then
@@ -36,6 +37,20 @@ render_pool_servers() {
 "
 	done
 	printf '%s' "$out"
+}
+
+render_sched_config() {
+	# sched_priority N runs chronyd's clock/packet handling under SCHED_FIFO
+	# at real-time priority N, and lock_all (in the template) mlockall()s it
+	# so it's never paged out under memory pressure. Both are best-effort:
+	# chronyd logs and continues if sched_setscheduler/mlockall fail (e.g.
+	# no CAP_SYS_NICE/CAP_IPC_LOCK, or RT group scheduling denying the
+	# request - see scripts/check-host.sh), it just runs unprioritized.
+	if [ "${CHRONY_SCHED_PRIORITY:-0}" -gt 0 ] 2>/dev/null; then
+		printf 'sched_priority %s\n' "$CHRONY_SCHED_PRIORITY"
+	else
+		printf ''
+	fi
 }
 
 render_nts_config() {
@@ -75,6 +90,7 @@ hash_nts_files() {
 render_config() {
 	pool_block="$(render_pool_servers)"
 	nts_block="$(render_nts_config)"
+	sched_block="$(render_sched_config)"
 	sed \
 		-e "s#\${GRANDMASTER_HOST}#${GRANDMASTER_HOST}#g" \
 		-e "s#\${RATELIMIT_INTERVAL}#${RATELIMIT_INTERVAL}#g" \
@@ -84,10 +100,11 @@ render_config() {
 		"$TEMPLATE" >"$RENDERED.tmp"
 	# Multi-line substitutions can't safely go through sed's s#..#..# above,
 	# so splice them in with awk instead.
-	awk -v pool="$pool_block" -v nts="$nts_block" '
+	awk -v pool="$pool_block" -v nts="$nts_block" -v sched="$sched_block" '
 		{
 			if ($0 == "__POOL_SERVERS__") { printf "%s", pool; next }
 			if ($0 == "__NTS_CONFIG__") { printf "%s", nts; next }
+			if ($0 == "__SCHED_CONFIG__") { printf "%s", sched; next }
 			print
 		}
 	' "$RENDERED.tmp" >"$RENDERED"

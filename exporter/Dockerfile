@@ -1,10 +1,16 @@
-FROM alpine:3.20
+FROM golang:1.25-alpine AS build
 
-RUN apk add --no-cache python3 py3-pip
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags=-s -o /exporter ./cmd/exporter
 
-COPY requirements.txt /app/requirements.txt
-RUN pip install --break-system-packages --no-cache-dir -r /app/requirements.txt
+# distroless/static:nonroot can't be used: the capture socket needs
+# NET_RAW, which the container's user must hold, so this keeps running as
+# root like the previous Python image did.
+FROM gcr.io/distroless/static
 
-COPY exporter.py /app/exporter.py
+COPY --from=build /exporter /exporter
 
-CMD ["python3", "/app/exporter.py"]
+ENTRYPOINT ["/exporter"]
