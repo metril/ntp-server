@@ -1,6 +1,6 @@
 .env
 chrony-data/
-geoip/
+/geoip/
 HANDOFF.md
 *.handoff.md
 notes/
