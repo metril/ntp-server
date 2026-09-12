@@ -72,6 +72,14 @@ It reports:
   Orange Pi 5's hwmon names (`*_thermal` + `nvme`, matched on the `chip_name` label); on a
   different board, use these names to edit the panel's `chip_name` regex.
 
+It also checks `net.core.rmem_max`, the kernel's ceiling on a socket's `SO_RCVBUF`. The
+exporter's capture socket requests an 8 MiB buffer so it can absorb a slow flush without
+overflowing, but the kernel silently caps the request at whatever `net.core.rmem_max` is —
+the Linux default (~208 KiB) is only about 100 frames, and once the buffer fills the kernel
+drops packets before they ever reach the exporter (`ntp_capture_kernel_drops_total`, see
+below). The checker offers to raise it via a `sysctl.d` drop-in; it's a `WARN`, not a `FAIL`,
+because a capped buffer degrades under load rather than breaking the container outright.
+
 It also creates `./chrony-data` next to the compose file if missing. Alloy keeps its state
 (remote_write WAL, log positions) on a 256m tmpfs so it never writes to the Pi's storage;
 the cost is that samples buffered during a VictoriaMetrics outage don't survive a restart.
@@ -226,6 +234,9 @@ skew and any kernel capture loss (see `ntp_capture_kernel_drops_total`);
 `ntp_clients_scrape_success` is 1 while the capture socket is open.
 `ntp_capture_packets_total{direction}`, `ntp_capture_parse_errors_total`,
 `ntp_capture_loop_errors_total`, and `ntp_capture_kernel_drops_total` are self-monitoring.
+`ntp_capture_rcvbuf_bytes` is the capture socket's effective `SO_RCVBUF` as reported by
+`getsockopt` after the request — watch it alongside `ntp_capture_kernel_drops_total`; if
+it's below the requested size, `net.core.rmem_max` is capping it (see "Host prep" above).
 `ntp_geoip_database_loaded{db="country"|"asn"}` is 1 while the corresponding GeoLite2 mmdb
 is open and readable, 0 if it's missing or failed to open.
 `ntp_client_requests_by_version_total{version}` and `ntp_client_requests_by_family_total{family}`

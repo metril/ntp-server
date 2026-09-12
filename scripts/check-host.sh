@@ -192,6 +192,25 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# net.core.rmem_max must be large enough that the exporter's capture socket
+# SO_RCVBUF request isn't silently capped -- a capped buffer overflows under
+# load and packets are dropped before userspace ever sees them.
+# ---------------------------------------------------------------------------
+if command -v sysctl >/dev/null 2>&1; then
+    rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
+    if [ "$rmem_max" -lt 8388608 ]; then
+        offer_fix \
+            "net.core.rmem_max is ${rmem_max} bytes, below the 8388608 the capture socket requests" \
+            "sh -c 'echo \"net.core.rmem_max = 8388608\" > /etc/sysctl.d/90-ntp-capture.conf && chmod 0644 /etc/sysctl.d/90-ntp-capture.conf && sysctl --system'" \
+            warn
+    else
+        info "net.core.rmem_max is ${rmem_max} bytes"
+    fi
+else
+    warn "sysctl not found, cannot check net.core.rmem_max"
+fi
+
+# ---------------------------------------------------------------------------
 # Docker logging driver. Alloy's discovery.docker + loki.source.docker tail
 # container stdout via the Docker API, which needs json-file (or local).
 # ---------------------------------------------------------------------------

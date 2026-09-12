@@ -54,17 +54,39 @@ def test_top_n_asns_ranks_by_cumulative_total():
 
 
 def test_fold_asn_keeps_top_n_labels():
-    totals = {13335: 100, 15169: 50, 64512: 10}
-    assert fold_asn(13335, "Cloudflare", totals, 2) == (13335, "Cloudflare")
+    top_asns = {13335, 15169}
+    assert fold_asn(13335, "Cloudflare", top_asns) == (13335, "Cloudflare")
 
 
 def test_fold_asn_folds_rest_to_other():
-    totals = {13335: 100, 15169: 50, 64512: 10}
-    assert fold_asn(64512, "Small ISP", totals, 2) == ("other", "other")
+    top_asns = {13335, 15169}
+    assert fold_asn(64512, "Small ISP", top_asns) == ("other", "other")
 
 
 def test_fold_asn_unknown_asn_is_unknown():
-    assert fold_asn(None, "unknown", {}, 25) == ("unknown", "unknown")
+    assert fold_asn(None, "unknown", set()) == ("unknown", "unknown")
+
+
+def test_flush_prunes_asn_totals_to_asn_totals_max_without_changing_top_n(monkeypatch):
+    # Pruning only needs to keep the head of the distribution; if it changed
+    # the top-N set, ntp_client_requests_by_asn_total labels would flap.
+    from exporter import PacketCollector
+
+    monkeypatch.setattr(exporter, "ASN_TOTALS_MAX", 5)
+    c = PacketCollector(
+        SimpleNamespace(resolve=lambda ip: ("US", "NA", None, "unknown")),
+        5,
+        lambda: None,
+        clock=lambda: 0.0,
+        wall=lambda: 0.0,
+    )
+    c._asn_totals = {i: (1000 - i) for i in range(50)}  # asn 0..4 have the 5 largest totals
+    top_before = top_n_asns(c._asn_totals, 5)
+
+    c.flush()
+
+    assert len(c._asn_totals) == 5
+    assert set(c._asn_totals) == top_before
 
 
 # --- parse_ntppool -----------------------------------------------------------

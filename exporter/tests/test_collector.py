@@ -1,4 +1,6 @@
 import socket
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -155,6 +157,9 @@ def test_open_capture_socket_attaches_filter_and_returns_the_socket(monkeypatch)
         def setsockopt(self, level, optname, value):
             setsockopt_calls.append((level, optname))
 
+        def getsockopt(self, level, optname):
+            return exporter.CAPTURE_RCVBUF_BYTES * 2
+
         def settimeout(self, t):
             self.timeout = t
 
@@ -170,6 +175,53 @@ def test_open_capture_socket_attaches_filter_and_returns_the_socket(monkeypatch)
     assert (socket.SOL_SOCKET, exporter.SO_ATTACH_FILTER) in setsockopt_calls
     assert (socket.SOL_SOCKET, socket.SO_RCVBUF) in setsockopt_calls
     assert fake.timeout == 1.0
+
+
+def test_open_capture_socket_sets_the_rcvbuf_gauge_from_getsockopt(monkeypatch):
+    class FakeSock:
+        def setsockopt(self, level, optname, value):
+            pass
+
+        def getsockopt(self, level, optname):
+            return exporter.CAPTURE_RCVBUF_BYTES * 2  # kernel doubles an honoured request
+
+        def settimeout(self, t):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(exporter.socket, "socket", lambda *a, **k: FakeSock())
+
+    exporter.open_capture_socket()
+
+    assert exporter.ntp_capture_rcvbuf_bytes._value.get() == exporter.CAPTURE_RCVBUF_BYTES * 2
+
+
+def test_open_capture_socket_warns_once_when_rcvbuf_is_capped(monkeypatch, caplog):
+    exporter.open_capture_socket.warned = False  # reset the once-only latch between tests
+
+    class FakeSock:
+        def setsockopt(self, level, optname, value):
+            pass
+
+        def getsockopt(self, level, optname):
+            return exporter.CAPTURE_RCVBUF_BYTES  # equals the request, not 2x: rmem_max capped it to half
+
+        def settimeout(self, t):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(exporter.socket, "socket", lambda *a, **k: FakeSock())
+
+    with caplog.at_level("WARNING"):
+        exporter.open_capture_socket()
+        exporter.open_capture_socket()
+
+    warnings = [r for r in caplog.records if "rmem_max" in r.message]
+    assert len(warnings) == 1
 
 
 # --- run_forever -------------------------------------------------------
@@ -211,7 +263,7 @@ def test_run_forever_recovers_from_a_sock_factory_error(monkeypatch):
     )
 
     with pytest.raises(StopCapture):
-        c.run_forever(15)
+        c.run_forever()
 
     assert sleeps == [30]
     assert success_values == [0, 1]
@@ -253,7 +305,7 @@ def test_run_forever_survives_a_geo_exception_and_keeps_capturing(monkeypatch):
     before_req = counter(exporter.ntp_capture_packets_total, direction="request")
 
     with pytest.raises(StopCapture):
-        c.run_forever(15)
+        c.run_forever()
 
     assert exporter.ntp_capture_loop_errors_total._value.get() == before + 1
     # first frame raised on geo.resolve and was swallowed; second frame (the
@@ -366,6 +418,9 @@ def test_open_capture_socket_sets_so_timestampns(monkeypatch):
         def setsockopt(self, level, optname, value):
             setsockopt_calls.append((level, optname))
 
+        def getsockopt(self, level, optname):
+            return exporter.CAPTURE_RCVBUF_BYTES * 2
+
         def settimeout(self, t):
             pass
 
@@ -408,7 +463,7 @@ def test_run_forever_passes_recvmsg_timestamp_to_handle_frame(monkeypatch):
     c = PacketCollector(fake_geo(), 25, lambda: FakeSock(), clock=clock, wall=lambda: 0.0)
 
     with pytest.raises(StopCapture):
-        c.run_forever(15)
+        c.run_forever()
 
     assert calls == [42.5]
 
@@ -606,3 +661,77 @@ def test_request_interval_help_text_explains_the_active_window():
         "longer than roughly 300s are not observed because the client has left the "
         "active window"
     )
+
+
+# --- flush() off the capture thread (locking) -----------------------------
+
+
+def test_handle_frame_and_flush_run_concurrently_without_losing_updates():
+    # Regression test for moving flush() off the capture thread: hammer
+    # handle_frame from a background thread while flush()ing repeatedly on
+    # the main thread. No exception should escape either side, and every
+    # frame handled must still be reflected in the packet counter exactly
+    # once -- i.e. the lock must make handle_frame/flush mutations atomic
+    # with respect to each other.
+    clock = FakeClock()
+    c = make(clock)
+    before = counter(exporter.ntp_capture_packets_total, direction="request")
+
+    stop = threading.Event()
+    sent = [0]
+    errors = []
+
+    def hammer():
+        i = 0
+        try:
+            while not stop.is_set():
+                ip = f"10.{(i >> 16) & 0xFF}.{(i >> 8) & 0xFF}.{i & 0xFF}"
+                c.handle_frame(request_frame(ip))
+                sent[0] += 1
+                i += 1
+        except Exception as exc:  # pragma: no cover - surfaced via `errors`
+            errors.append(exc)
+
+    t = threading.Thread(target=hammer)
+    t.start()
+    deadline = time.monotonic() + 0.2
+    try:
+        while time.monotonic() < deadline:
+            c.flush()
+    finally:
+        stop.set()
+        t.join()
+    c.flush()  # account for anything handled after the last in-loop flush
+
+    assert errors == []
+    assert counter(exporter.ntp_capture_packets_total, direction="request") == before + sent[0]
+
+
+# --- flush() performance with a large cumulative ASN table -----------------
+
+
+def test_flush_completes_quickly_with_a_large_cumulative_asn_table():
+    # Regression test for the 56% capture drop: flush() used to sort the
+    # entire cumulative ASN table once per distinct ASN in the window.
+    clock = FakeClock()
+    next_asn = [0]
+
+    def fake_resolve(ip):
+        next_asn[0] += 1
+        asn = next_asn[0]
+        return ("US", "NA", asn, f"Org{asn}")
+
+    c = PacketCollector(
+        SimpleNamespace(resolve=fake_resolve), 25, lambda: None, clock=clock, wall=lambda: 0.0
+    )
+    c._asn_totals = {i: i for i in range(20000)}  # 20000 cumulative ASNs
+
+    for i in range(3000):  # 3000 distinct ASNs in this window
+        ip = f"203.0.{(i >> 8) & 0xFF}.{i & 0xFF}"
+        c.handle_frame(request_frame(ip))
+
+    start = time.monotonic()
+    c.flush()
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 1.0
