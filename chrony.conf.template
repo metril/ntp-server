@@ -16,7 +16,7 @@ leapsectz right/UTC
 
 # Serving.
 allow all
-ratelimit interval ${RATELIMIT_INTERVAL} burst ${RATELIMIT_BURST} leak 2
+ratelimit interval ${RATELIMIT_INTERVAL} burst ${RATELIMIT_BURST} leak ${RATELIMIT_LEAK}
 clientloglimit ${CLIENTLOGLIMIT}
 # Never noclientlog - it kills ratelimit and the clients metrics.
 

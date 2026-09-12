@@ -109,7 +109,7 @@ Copy `.env.example` to `.env` and fill in:
 | `VL_USER` / `VL_PASSWORD` | yes | Basic auth for `VL_URL`. |
 | `DOCKER_GID` | yes | From `scripts/check-host.sh`; lets Alloy read `docker.sock`. |
 | `POOL_SERVERS` | no | Extra space-separated fallback NTP servers (added on top of the built-in `time.cloudflare.com`, `time.nist.gov`, `pool 2.pool.ntp.org`). |
-| `RATELIMIT_INTERVAL` / `RATELIMIT_BURST` | no | `ratelimit` line defaults (`3` / `8`). |
+| `RATELIMIT_INTERVAL` / `RATELIMIT_BURST` / `RATELIMIT_LEAK` | no | `ratelimit` line defaults (`3` / `8` / `2`); `leak N` still answers 1 in 2^N rate-limited requests. |
 | `CLIENTLOGLIMIT` | no | Bytes of per-client log memory (default `16777216`); never set `noclientlog`, it disables `ratelimit`. |
 | `NTS_ENABLED` | no | `true` to enable NTS (see below); default `false`. |
 | `NTS_CERT_DIR` | if NTS | Host directory containing an externally-renewed cert/key, mounted read-only at `/certs` (mount the directory, not the files, so renewal isn't orphaned by inode pinning — see `.env.example` for the Let's Encrypt symlink caveat). |
@@ -200,7 +200,7 @@ the basemap can be reset to "Default" once you upgrade.
 
 ## Rate limit & clientloglimit tuning
 
-`ratelimit interval ${RATELIMIT_INTERVAL} burst ${RATELIMIT_BURST} leak 2` in
+`ratelimit interval ${RATELIMIT_INTERVAL} burst ${RATELIMIT_BURST} leak ${RATELIMIT_LEAK}` in
 `chrony.conf.template` throttles abusive clients; `clientloglimit` bounds the memory used
 to track per-client state for it. Watch:
 

@@ -19,6 +19,7 @@ NTS_CERT_TMP=/tmp/nts-server.crt
 NTS_ENABLED="${NTS_ENABLED:-false}"
 RATELIMIT_INTERVAL="${RATELIMIT_INTERVAL:-3}"
 RATELIMIT_BURST="${RATELIMIT_BURST:-8}"
+RATELIMIT_LEAK="${RATELIMIT_LEAK:-2}"
 CLIENTLOGLIMIT="${CLIENTLOGLIMIT:-4194304}"
 POOL_SERVERS="${POOL_SERVERS:-}"
 
@@ -78,6 +79,7 @@ render_config() {
 		-e "s#\${GRANDMASTER_HOST}#${GRANDMASTER_HOST}#g" \
 		-e "s#\${RATELIMIT_INTERVAL}#${RATELIMIT_INTERVAL}#g" \
 		-e "s#\${RATELIMIT_BURST}#${RATELIMIT_BURST}#g" \
+		-e "s#\${RATELIMIT_LEAK}#${RATELIMIT_LEAK}#g" \
 		-e "s#\${CLIENTLOGLIMIT}#${CLIENTLOGLIMIT}#g" \
 		"$TEMPLATE" >"$RENDERED.tmp"
 	# Multi-line substitutions can't safely go through sed's s#..#..# above,
