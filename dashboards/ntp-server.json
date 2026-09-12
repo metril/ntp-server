@@ -596,75 +596,6 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "red"
-              },
-              {
-                "color": "orange",
-                "value": 50
-              },
-              {
-                "color": "green",
-                "value": 90
-              }
-            ]
-          },
-          "unit": "percent"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "x": 8,
-        "y": 6,
-        "w": 4,
-        "h": 4
-      },
-      "id": 307,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "none",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "value",
-        "orientation": "auto",
-        "justifyMode": "center",
-        "text": {
-          "titleSize": 14,
-          "valueSize": 34
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "victoriametrics-metrics-datasource",
-            "uid": "${datasource}"
-          },
-          "expr": "100*sum(rate(ntp_capture_packets_total{host=\"$host\", direction=\"request\"}[5m]))/sum(rate(chrony_serverstats_ntp_packets_received_total{host=\"$host\"}[5m]))",
-          "legendFormat": "coverage %",
-          "refId": "A"
-        }
-      ],
-      "title": "Capture coverage %",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "victoriametrics-metrics-datasource",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
                 "color": "green"
               },
               {
@@ -678,7 +609,7 @@
         "overrides": []
       },
       "gridPos": {
-        "x": 12,
+        "x": 8,
         "y": 6,
         "w": 4,
         "h": 4
@@ -1095,7 +1026,7 @@
       "gridPos": {
         "x": 0,
         "y": 28,
-        "w": 12,
+        "w": 24,
         "h": 7
       },
       "id": 52,
@@ -1148,7 +1079,7 @@
         "overrides": []
       },
       "gridPos": {
-        "x": 16,
+        "x": 12,
         "y": 6,
         "w": 4,
         "h": 4
@@ -1228,7 +1159,7 @@
         "overrides": []
       },
       "gridPos": {
-        "x": 20,
+        "x": 16,
         "y": 6,
         "w": 4,
         "h": 4
@@ -1274,57 +1205,6 @@
       ],
       "title": "Exporters",
       "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "victoriametrics-metrics-datasource",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "lineWidth": 1,
-            "showPoints": "never"
-          },
-          "max": 110,
-          "unit": "percent"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "x": 12,
-        "y": 28,
-        "w": 12,
-        "h": 7
-      },
-      "id": 203,
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true,
-          "calcs": []
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "victoriametrics-metrics-datasource",
-            "uid": "${datasource}"
-          },
-          "expr": "100*sum(rate(ntp_capture_packets_total{host=\"$host\", direction=\"request\"}[5m]))/sum(rate(chrony_serverstats_ntp_packets_received_total{host=\"$host\"}[5m]))",
-          "legendFormat": "coverage %",
-          "refId": "A"
-        }
-      ],
-      "title": "Capture coverage %",
-      "type": "timeseries"
     },
     {
       "collapsed": false,
