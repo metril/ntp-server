@@ -5,6 +5,14 @@ grandmaster (with fallback sources so a bad grandmaster gets outvoted), serves c
 UDP 123, and optionally serves NTS on TCP 4460. A Grafana Alloy sidecar scrapes chrony +
 host metrics to VictoriaMetrics and tails container logs to VictoriaLogs.
 
+> **Note (2026-10):** on ouranos, Alloy is now deployed from the azureolympos repo
+> (`hosts/ouranos/stacks/alloy/`) with the fleet label scheme, not from this repo's
+> `alloy` service and `config/config.alloy`. Metrics still carry `host` (the node job is
+> `integrations/unix`). Logs are `{job="containers", compose_project="ntp-server",
+> container_name=…}`, and `host` is a field, not a stream label. The dashboards here
+> follow that scheme. The bundled Alloy config stays as a standalone reference, but its
+> log labels (`job="ntp-server"`, `container`) no longer match the dashboards.
+
 ```
                     ┌─────────────────────────────────────┐
 NTP clients ──UDP 123──▶ chrony (network_mode: host) ──────┤ /var/lib/chrony (drift, NTS dump)
@@ -187,7 +195,7 @@ stay flat at the target rate.
 
 ```
 chrony_tracking_stratum{host="<ALLOY_INSTANCE>"}
-{job="ntp-server"}
+{job="containers", compose_project="ntp-server"}
 ```
 
 ## Grafana import

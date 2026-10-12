@@ -1,6 +1,11 @@
 // ntp-server: Alloy sidecar collecting host + chrony metrics and container
 // logs, forwarding to VictoriaMetrics (remote_write) and VictoriaLogs (Loki
 // push). Mirrors the conventions of ~/projects/grafana-alloy/config/config.alloy.
+//
+// NOTE: ouranos no longer runs this file. Alloy is deployed from azureolympos
+// (hosts/ouranos/stacks/alloy/) with fleet labels. Its log streams are
+// {job="containers", compose_project, compose_service, container_name}, with
+// host as a field. The dashboards follow that scheme, not the labels below.
 
 logging {
 	level  = "info"
