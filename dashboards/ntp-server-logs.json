@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "VictoriaLogs for the NTP server (job=ntp-server).",
+  "description": "VictoriaLogs for the NTP server (job=containers, compose_project=ntp-server).",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -46,8 +46,8 @@
       "targets": [
         {
           "datasource": { "type": "victoriametrics-logs-datasource", "uid": "dfxl6qe5kkum8c" },
-          "expr": "{job=\"ntp-server\", host=~\"${host:regex}\"} ~\"(?i)$search\" | stats by (container) count() as count",
-          "legendFormat": "{{container}}",
+          "expr": "{job=\"containers\", compose_project=\"ntp-server\"} host:~\"^(${host:regex})$\" ~\"(?i)$search\" | stats by (container_name) count() as count",
+          "legendFormat": "{{container_name}}",
           "queryType": "statsRange",
           "refId": "A"
         }
@@ -71,7 +71,7 @@
       "targets": [
         {
           "datasource": { "type": "victoriametrics-logs-datasource", "uid": "dfxl6qe5kkum8c" },
-          "expr": "{job=\"ntp-server\", host=~\"${host:regex}\"} ~\"(?i)$search\"",
+          "expr": "{job=\"containers\", compose_project=\"ntp-server\"} host:~\"^(${host:regex})$\" ~\"(?i)$search\"",
           "queryType": "raw",
           "refId": "A"
         }
@@ -96,7 +96,7 @@
         },
         "allValue": ".+",
         "datasource": { "type": "victoriametrics-logs-datasource", "uid": "dfxl6qe5kkum8c" },
-        "definition": "field_values(host, {job=\"ntp-server\"})",
+        "definition": "field_values(host, {job=\"containers\", compose_project=\"ntp-server\"})",
         "includeAll": true,
         "label": "Host",
         "multi": true,
@@ -104,7 +104,7 @@
         "query": {
           "field": "host",
           "limit": 1000,
-          "query": "{job=\"ntp-server\"}",
+          "query": "{job=\"containers\", compose_project=\"ntp-server\"}",
           "refId": "VictoriaLogsVariableQueryEditor-VariableQuery",
           "type": "fieldValue"
         },
